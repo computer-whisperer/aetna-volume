@@ -6,6 +6,10 @@ use aetna_volume::{
     model::{AudioCard, AudioNode, AudioSnapshot, Tab, Volume},
 };
 
+const MAX_VOLUME_PERCENT: u32 = 150;
+const SLIDER_THUMB_SIZE: f32 = 14.0;
+const SLIDER_TRACK_HEIGHT: f32 = 10.0;
+
 struct VolumeApp {
     backend: Box<dyn AudioBackend>,
     snapshot: AudioSnapshot,
@@ -40,9 +44,7 @@ impl VolumeApp {
         let (Some(target), Some((x, _))) = (&event.target, event.pointer) else {
             return;
         };
-        let pct = ((x - target.rect.x) / target.rect.w * 100.0)
-            .round()
-            .clamp(0.0, 150.0) as u32;
+        let pct = slider_percent_from_x(target.rect, x);
         self.volume_overrides.insert(id, pct);
         let muted = self
             .snapshot
@@ -310,40 +312,56 @@ fn volume_slider(id: u32, percent: u32, muted: bool) -> El {
     } else {
         tokens::PRIMARY
     };
-    let pct = (percent as f32 / 100.0).clamp(0.0, 1.5);
+    let pct = (percent as f32 / MAX_VOLUME_PERCENT as f32).clamp(0.0, 1.0);
+    let slider_layout = move |ctx: LayoutCtx| {
+        let rect = ctx.container;
+        let usable = (rect.w - SLIDER_THUMB_SIZE).max(1.0);
+        let track_x = rect.x + SLIDER_THUMB_SIZE * 0.5;
+        let track_y = rect.y + (rect.h - SLIDER_TRACK_HEIGHT) * 0.5;
+        let thumb_x = rect.x + pct * usable;
+        let thumb_y = rect.y + (rect.h - SLIDER_THUMB_SIZE) * 0.5;
+        vec![
+            Rect::new(track_x, track_y, usable, SLIDER_TRACK_HEIGHT),
+            Rect::new(track_x, track_y, pct * usable, SLIDER_TRACK_HEIGHT),
+            Rect::new(thumb_x, thumb_y, SLIDER_THUMB_SIZE, SLIDER_THUMB_SIZE),
+        ]
+    };
+
     stack([
         El::new(Kind::Custom("meter-track"))
-            .height(Size::Fixed(10.0))
+            .height(Size::Fixed(SLIDER_TRACK_HEIGHT))
             .width(Size::Fill(1.0))
             .fill(tokens::BG_MUTED)
             .radius(tokens::RADIUS_PILL),
         El::new(Kind::Custom("meter-fill"))
-            .height(Size::Fixed(10.0))
-            .width(Size::Fill(pct.min(1.0)))
+            .height(Size::Fixed(SLIDER_TRACK_HEIGHT))
+            .width(Size::Fill(1.0))
             .fill(fill)
             .radius(tokens::RADIUS_PILL),
-        row([
-            spacer().width(Size::Fill(pct.min(1.0))),
-            El::new(Kind::Custom("slider-thumb"))
-                .width(Size::Fixed(14.0))
-                .height(Size::Fixed(14.0))
-                .fill(tokens::TEXT_FOREGROUND)
-                .stroke(tokens::BORDER)
-                .radius(tokens::RADIUS_PILL),
-            spacer().width(Size::Fill((1.0 - pct.min(1.0)).max(0.0))),
-        ])
-        .align(Align::Center)
-        .height(Size::Fixed(18.0))
-        .width(Size::Fill(1.0)),
+        El::new(Kind::Custom("slider-thumb"))
+            .width(Size::Fixed(SLIDER_THUMB_SIZE))
+            .height(Size::Fixed(SLIDER_THUMB_SIZE))
+            .fill(tokens::TEXT_FOREGROUND)
+            .stroke(tokens::BORDER)
+            .radius(tokens::RADIUS_PILL),
     ])
     .key(format!("volume:{id}"))
     .focusable()
+    .layout(slider_layout)
     .height(Size::Fixed(18.0))
     .width(Size::Fill(1.0))
 }
 
 fn node_id_from_key(key: &str, prefix: &str) -> Option<u32> {
     key.strip_prefix(prefix)?.parse().ok()
+}
+
+fn slider_percent_from_x(rect: Rect, x: f32) -> u32 {
+    let usable = (rect.w - SLIDER_THUMB_SIZE).max(1.0);
+    let local = x - rect.x - SLIDER_THUMB_SIZE * 0.5;
+    (local / usable * MAX_VOLUME_PERCENT as f32)
+        .round()
+        .clamp(0.0, MAX_VOLUME_PERCENT as f32) as u32
 }
 
 fn badge(label: impl Into<String>) -> El {
@@ -402,4 +420,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         viewport,
         VolumeApp::new(Box::new(PipeWireBackend::new())),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slider_percent_tracks_thumb_center() {
+        let rect = Rect::new(10.0, 20.0, 220.0, 18.0);
+        let left = rect.x + SLIDER_THUMB_SIZE * 0.5;
+        let usable = rect.w - SLIDER_THUMB_SIZE;
+        assert_eq!(slider_percent_from_x(rect, left), 0);
+        assert_eq!(slider_percent_from_x(rect, left + usable * 0.5), 75);
+        assert_eq!(slider_percent_from_x(rect, left + usable), 150);
+        assert_eq!(slider_percent_from_x(rect, rect.x - 30.0), 0);
+        assert_eq!(slider_percent_from_x(rect, rect.x + rect.w + 30.0), 150);
+    }
 }
