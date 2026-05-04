@@ -22,6 +22,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(DEFAULT_BUFFERS);
+    let capture_sink = env::var("AETNA_LEVEL_CAPTURE_SINK")
+        .ok()
+        .map(|value| value != "0" && value != "false")
+        .unwrap_or(true);
 
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -33,8 +37,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *pw::keys::MEDIA_CATEGORY => "Capture",
         *pw::keys::MEDIA_ROLE => "Music",
         *pw::keys::NODE_NAME => "aetna-volume.level-probe",
-        *pw::keys::STREAM_CAPTURE_SINK => "true",
     };
+    if capture_sink {
+        props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
+    }
     if let Some(target) = target {
         props.insert("target.object", target.to_string());
     }

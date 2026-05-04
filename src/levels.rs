@@ -5,7 +5,9 @@ use spa::param::format_utils;
 use spa::pod::Pod;
 use std::{
     collections::{HashMap, HashSet},
+    io::Read,
     mem,
+    process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex, Once,
         atomic::{AtomicBool, Ordering},
@@ -50,7 +52,7 @@ impl LevelService {
         let wanted = snapshot
             .nodes
             .iter()
-            .filter(|node| capture_sink_for(node).is_some())
+            .filter(|node| meter_route_for(node).is_some())
             .map(|node| node.id)
             .collect::<HashSet<_>>();
         self.meters.retain(|node_id, meter| {
@@ -83,12 +85,12 @@ impl LevelService {
         if self.meters.contains_key(&node.id) {
             return;
         }
-        let Some(capture_sink) = capture_sink_for(node) else {
+        let Some(route) = meter_route_for(node) else {
             return;
         };
         let stop = Arc::new(AtomicBool::new(false));
-        spawn_meter(node.id, capture_sink, self.levels.clone(), stop.clone());
-        self.meters.insert(node.id, MeterHandle { stop });
+        let child = spawn_meter(node.id, route, self.levels.clone(), stop.clone());
+        self.meters.insert(node.id, MeterHandle { stop, child });
     }
 }
 
@@ -96,12 +98,18 @@ impl Drop for LevelService {
     fn drop(&mut self) {
         for meter in self.meters.values() {
             meter.stop.store(true, Ordering::Relaxed);
+            if let Some(child) = &meter.child
+                && let Ok(mut child) = child.lock()
+            {
+                let _ = child.kill();
+            }
         }
     }
 }
 
 struct MeterHandle {
     stop: Arc<AtomicBool>,
+    child: Option<Arc<Mutex<Child>>>,
 }
 
 struct MeterData {
@@ -114,41 +122,73 @@ struct MeterData {
     smooth_rms: Vec<f32>,
 }
 
-fn capture_sink_for(node: &AudioNode) -> Option<bool> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MeterRoute {
+    PipeWire { capture_sink: bool },
+    PulseMonitor { stream_id: u32 },
+}
+
+fn meter_route_for(node: &AudioNode) -> Option<MeterRoute> {
     match node.class {
         AudioClass::Device {
             direction: Direction::Output,
-        }
-        | AudioClass::Stream {
-            direction: Direction::Output,
-        } => Some(true),
+        } => Some(MeterRoute::PipeWire { capture_sink: true }),
         AudioClass::Device {
             direction: Direction::Input,
-        }
-        | AudioClass::Stream {
+        } => Some(MeterRoute::PipeWire {
+            capture_sink: false,
+        }),
+        AudioClass::Stream {
+            direction: Direction::Output,
+        } => node
+            .monitor_stream_id
+            .map(|stream_id| MeterRoute::PulseMonitor { stream_id }),
+        AudioClass::Stream {
             direction: Direction::Input,
-        } => Some(false),
+        } => Some(MeterRoute::PipeWire {
+            capture_sink: false,
+        }),
         _ => None,
     }
 }
 
 fn spawn_meter(
     node_id: u32,
-    capture_sink: bool,
+    route: MeterRoute,
     levels: Arc<Mutex<HashMap<u32, NodeLevels>>>,
     stop: Arc<AtomicBool>,
-) {
-    thread::Builder::new()
-        .name(format!("aetna-volume-meter-{node_id}"))
-        .spawn(move || {
-            if let Err(err) = run_meter(node_id, capture_sink, levels, stop) {
-                eprintln!("aetna-volume: level meter for node {node_id} stopped: {err}");
-            }
-        })
-        .expect("spawn PipeWire level meter");
+) -> Option<Arc<Mutex<Child>>> {
+    match route {
+        MeterRoute::PipeWire { capture_sink } => {
+            thread::Builder::new()
+                .name(format!("aetna-volume-meter-{node_id}"))
+                .spawn(move || {
+                    if let Err(err) = run_pipewire_meter(node_id, capture_sink, levels, stop) {
+                        eprintln!("aetna-volume: level meter for node {node_id} stopped: {err}");
+                    }
+                })
+                .expect("spawn PipeWire level meter");
+            None
+        }
+        MeterRoute::PulseMonitor { stream_id } => {
+            let child = spawn_pulse_meter_process(stream_id)
+                .map(|child| Arc::new(Mutex::new(child)))
+                .ok();
+            let child_for_thread = child.clone();
+            thread::Builder::new()
+                .name(format!("aetna-volume-pulse-meter-{node_id}"))
+                .spawn(move || {
+                    if let Some(child) = child_for_thread {
+                        run_pulse_meter(node_id, child, levels, stop);
+                    }
+                })
+                .expect("spawn Pulse monitor meter");
+            child
+        }
+    }
 }
 
-fn run_meter(
+fn run_pipewire_meter(
     node_id: u32,
     capture_sink: bool,
     levels: Arc<Mutex<HashMap<u32, NodeLevels>>>,
@@ -246,6 +286,55 @@ fn run_meter(
     Ok(())
 }
 
+fn spawn_pulse_meter_process(stream_id: u32) -> std::io::Result<Child> {
+    Command::new("parec")
+        .args([
+            "--raw",
+            "--format=float32le",
+            "--channels=2",
+            "--rate=48000",
+            "--device=@DEFAULT_MONITOR@",
+            "--latency-msec=50",
+            "--process-time-msec=25",
+            "--client-name=aetna-volume",
+            "--stream-name=aetna-volume-meter",
+            &format!("--monitor-stream={stream_id}"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+}
+
+fn run_pulse_meter(
+    node_id: u32,
+    child: Arc<Mutex<Child>>,
+    levels: Arc<Mutex<HashMap<u32, NodeLevels>>>,
+    stop: Arc<AtomicBool>,
+) {
+    let Some(mut stdout) = child.lock().ok().and_then(|mut child| child.stdout.take()) else {
+        return;
+    };
+    let mut smooth_peaks = Vec::new();
+    let mut smooth_rms = Vec::new();
+    let mut buf = vec![0_u8; 4096];
+    while !stop.load(Ordering::Relaxed) {
+        let Ok(read) = stdout.read(&mut buf) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        publish_level_samples(
+            node_id,
+            &buf[..read],
+            2,
+            &levels,
+            &mut smooth_peaks,
+            &mut smooth_rms,
+        );
+    }
+}
+
 fn process_meter_buffer(stream: &pw::stream::Stream, data: &mut MeterData) {
     let Some(mut buffer) = stream.dequeue_buffer() else {
         return;
@@ -268,6 +357,32 @@ fn process_meter_buffer(stream: &pw::stream::Stream, data: &mut MeterData) {
         return;
     }
 
+    publish_level_samples(
+        data.node_id,
+        &samples[..bytes.min(samples.len())],
+        channels,
+        &data.levels,
+        &mut data.smooth_peaks,
+        &mut data.smooth_rms,
+    );
+}
+
+fn publish_level_samples(
+    node_id: u32,
+    samples: &[u8],
+    channels: usize,
+    levels: &Arc<Mutex<HashMap<u32, NodeLevels>>>,
+    smooth_peaks: &mut Vec<f32>,
+    smooth_rms: &mut Vec<f32>,
+) {
+    if channels == 0 || samples.len() < 4 {
+        return;
+    }
+    let sample_count = samples.len() / 4;
+    if sample_count == 0 {
+        return;
+    }
+
     let mut peaks = vec![0.0_f32; channels];
     let mut sums = vec![0.0_f32; channels];
     let mut counts = vec![0_u32; channels];
@@ -284,34 +399,34 @@ fn process_meter_buffer(stream: &pw::stream::Stream, data: &mut MeterData) {
         counts[channel] += 1;
     }
 
-    resize_smoothing(data, channels);
+    resize_smoothing(smooth_peaks, smooth_rms, channels);
     for channel in 0..channels {
         let rms = if counts[channel] == 0 {
             0.0
         } else {
             (sums[channel] / counts[channel] as f32).sqrt()
         };
-        data.smooth_peaks[channel] = smooth(data.smooth_peaks[channel], peaks[channel], 0.70);
-        data.smooth_rms[channel] = smooth(data.smooth_rms[channel], rms, 0.82);
+        smooth_peaks[channel] = smooth(smooth_peaks[channel], peaks[channel], 0.70);
+        smooth_rms[channel] = smooth(smooth_rms[channel], rms, 0.82);
     }
 
-    if let Ok(mut levels) = data.levels.try_lock() {
+    if let Ok(mut levels) = levels.try_lock() {
         levels.insert(
-            data.node_id,
+            node_id,
             NodeLevels {
-                peaks: data.smooth_peaks.clone(),
-                rms: data.smooth_rms.clone(),
+                peaks: smooth_peaks.clone(),
+                rms: smooth_rms.clone(),
             },
         );
     }
 }
 
-fn resize_smoothing(data: &mut MeterData, channels: usize) {
-    if data.smooth_peaks.len() != channels {
-        data.smooth_peaks.resize(channels, 0.0);
+fn resize_smoothing(smooth_peaks: &mut Vec<f32>, smooth_rms: &mut Vec<f32>, channels: usize) {
+    if smooth_peaks.len() != channels {
+        smooth_peaks.resize(channels, 0.0);
     }
-    if data.smooth_rms.len() != channels {
-        data.smooth_rms.resize(channels, 0.0);
+    if smooth_rms.len() != channels {
+        smooth_rms.resize(channels, 0.0);
     }
 }
 
@@ -338,5 +453,56 @@ mod tests {
         let released = smooth(0.8, 0.2, 0.7);
         assert!(released > 0.2);
         assert!(released < 0.8);
+    }
+
+    #[test]
+    fn routes_use_sink_mix_only_for_output_devices() {
+        let output_device = test_node(AudioClass::Device {
+            direction: Direction::Output,
+        });
+        let mut output_stream = test_node(AudioClass::Stream {
+            direction: Direction::Output,
+        });
+        output_stream.monitor_stream_id = Some(42);
+        let input_device = test_node(AudioClass::Device {
+            direction: Direction::Input,
+        });
+        assert_eq!(
+            meter_route_for(&output_device),
+            Some(MeterRoute::PipeWire { capture_sink: true })
+        );
+        assert_eq!(
+            meter_route_for(&output_stream),
+            Some(MeterRoute::PulseMonitor { stream_id: 42 })
+        );
+        assert_eq!(
+            meter_route_for(&input_device),
+            Some(MeterRoute::PipeWire {
+                capture_sink: false
+            })
+        );
+    }
+
+    #[test]
+    fn output_stream_without_pulse_monitor_id_is_not_metered_from_sink_mix() {
+        let output_stream = test_node(AudioClass::Stream {
+            direction: Direction::Output,
+        });
+        assert_eq!(meter_route_for(&output_stream), None);
+    }
+
+    fn test_node(class: AudioClass) -> AudioNode {
+        AudioNode {
+            id: 1,
+            class,
+            name: "test".into(),
+            description: "test".into(),
+            application: None,
+            media_name: None,
+            target: None,
+            volume: None,
+            is_default: false,
+            monitor_stream_id: None,
+        }
     }
 }

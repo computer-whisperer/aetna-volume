@@ -131,6 +131,7 @@ where
 
     Some(AudioNode {
         id: global.id,
+        monitor_stream_id: monitor_stream_id(&class, props),
         class,
         name,
         description,
@@ -185,4 +186,13 @@ fn is_internal_aetna_node(props: &pw::spa::utils::dict::DictRef) -> bool {
         || prop(props, "application.name")
             .map(|name| name == "aetna-volume")
             .unwrap_or(false)
+}
+
+fn monitor_stream_id(class: &AudioClass, props: &pw::spa::utils::dict::DictRef) -> Option<u32> {
+    match class {
+        AudioClass::Stream {
+            direction: Direction::Output,
+        } => prop(props, "object.serial")?.parse().ok(),
+        _ => None,
+    }
 }
