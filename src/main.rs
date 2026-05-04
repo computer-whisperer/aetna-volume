@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
 use aetna_core::*;
 use aetna_volume::{
@@ -6,6 +6,9 @@ use aetna_volume::{
     levels::{LevelService, NodeLevels},
     model::{AudioCard, AudioNode, AudioSnapshot, Tab, Volume},
 };
+
+mod host;
+use host::run_volume_app;
 
 const MAX_VOLUME_PERCENT: u32 = 150;
 const SLIDER_THUMB_SIZE: f32 = 14.0;
@@ -127,10 +130,6 @@ impl App for VolumeApp {
             }
             _ => {}
         }
-    }
-
-    fn frame_interval(&self) -> Option<Duration> {
-        Some(Duration::from_millis(33))
     }
 }
 
@@ -514,7 +513,7 @@ fn status_bar(snapshot: &AudioSnapshot, meter_count: usize) -> El {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let viewport = Rect::new(0.0, 0.0, 980.0, 680.0);
-    aetna_demo::run(
+    run_volume_app(
         "Aetna Volume",
         viewport,
         VolumeApp::new(Box::new(PipeWireBackend::new())),
