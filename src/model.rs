@@ -64,6 +64,13 @@ impl Volume {
     pub fn percent(&self) -> u32 {
         (self.scalar * 100.0).round().clamp(0.0, 999.0) as u32
     }
+
+    pub fn from_percent(percent: u32, muted: bool) -> Self {
+        Self {
+            scalar: (percent as f32 / 100.0).clamp(0.0, 1.5),
+            muted,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,5 +219,9 @@ impl AudioSnapshot {
                 _ => false,
             })
             .collect()
+    }
+
+    pub fn node_mut(&mut self, id: u32) -> Option<&mut AudioNode> {
+        self.nodes.iter_mut().find(|node| node.id == id)
     }
 }

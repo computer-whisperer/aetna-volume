@@ -1,13 +1,16 @@
+use std::collections::HashMap;
+
 use aetna_core::*;
 use aetna_volume::{
     backend::{AudioBackend, pipewire_native::PipeWireBackend},
-    model::{AudioCard, AudioNode, AudioSnapshot, Tab},
+    model::{AudioCard, AudioNode, AudioSnapshot, Tab, Volume},
 };
 
 struct VolumeApp {
     backend: Box<dyn AudioBackend>,
     snapshot: AudioSnapshot,
     active_tab: Tab,
+    volume_overrides: HashMap<u32, u32>,
 }
 
 impl VolumeApp {
@@ -17,6 +20,53 @@ impl VolumeApp {
             backend,
             snapshot,
             active_tab: Tab::Playback,
+            volume_overrides: HashMap::new(),
+        }
+    }
+
+    fn percent_for(&self, node: &AudioNode) -> u32 {
+        self.volume_overrides
+            .get(&node.id)
+            .copied()
+            .or_else(|| node.volume.as_ref().map(Volume::percent))
+            .unwrap_or(100)
+    }
+
+    fn muted_for(&self, node: &AudioNode) -> bool {
+        node.volume.as_ref().map(|v| v.muted).unwrap_or(false)
+    }
+
+    fn scrub_from_event(&mut self, event: &UiEvent, id: u32) {
+        let (Some(target), Some((x, _))) = (&event.target, event.pointer) else {
+            return;
+        };
+        let pct = ((x - target.rect.x) / target.rect.w * 100.0)
+            .round()
+            .clamp(0.0, 150.0) as u32;
+        self.volume_overrides.insert(id, pct);
+        let muted = self
+            .snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .and_then(|node| node.volume.as_ref())
+            .map(|v| v.muted)
+            .unwrap_or(false);
+        if let Some(node) = self.snapshot.node_mut(id) {
+            node.volume = Some(Volume::from_percent(pct, muted));
+        }
+    }
+
+    fn toggle_mute(&mut self, id: u32) {
+        if let Some(node) = self.snapshot.node_mut(id) {
+            let current = node.volume.clone().unwrap_or(Volume {
+                scalar: 1.0,
+                muted: false,
+            });
+            node.volume = Some(Volume {
+                muted: !current.muted,
+                ..current
+            });
         }
     }
 }
@@ -25,7 +75,7 @@ impl App for VolumeApp {
     fn build(&self) -> El {
         let content = match self.active_tab {
             Tab::Configuration => configuration_panel(&self.snapshot.cards),
-            tab => node_panel(self.snapshot.nodes_for_tab(tab), tab),
+            tab => node_panel(self.snapshot.nodes_for_tab(tab), tab, self),
         };
 
         column([
@@ -55,6 +105,16 @@ impl App for VolumeApp {
                     self.active_tab = tab;
                 } else if key == "refresh" {
                     self.snapshot = self.backend.refresh();
+                    self.volume_overrides.clear();
+                } else if let Some(id) = node_id_from_key(key, "mute:") {
+                    self.toggle_mute(id);
+                } else if let Some(id) = node_id_from_key(key, "volume:") {
+                    self.scrub_from_event(&event, id);
+                }
+            }
+            UiEventKind::PointerDown | UiEventKind::Drag => {
+                if let Some(id) = node_id_from_key(key, "volume:") {
+                    self.scrub_from_event(&event, id);
                 }
             }
             _ => {}
@@ -107,11 +167,14 @@ fn sidebar(active: Tab) -> El {
     .radius(tokens::RADIUS_MD)
 }
 
-fn node_panel(nodes: Vec<&AudioNode>, tab: Tab) -> El {
+fn node_panel(nodes: Vec<&AudioNode>, tab: Tab, app: &VolumeApp) -> El {
     let rows = if nodes.is_empty() {
         vec![empty_state(tab)]
     } else {
-        nodes.into_iter().map(node_row).collect()
+        nodes
+            .into_iter()
+            .map(|node| node_row(node, app.percent_for(node), app.muted_for(node)))
+            .collect()
     };
 
     column([
@@ -149,9 +212,7 @@ fn panel_title(title: &'static str, subtitle: &'static str) -> El {
     .width(Size::Fill(1.0))
 }
 
-fn node_row(node: &AudioNode) -> El {
-    let volume = node.volume.as_ref().map(|v| v.percent()).unwrap_or(0);
-    let muted = node.volume.as_ref().map(|v| v.muted).unwrap_or(false);
+fn node_row(node: &AudioNode, volume: u32, muted: bool) -> El {
     let title = node
         .application
         .as_deref()
@@ -186,13 +247,14 @@ fn node_row(node: &AudioNode) -> El {
         ])
         .gap(tokens::SPACE_XS)
         .width(Size::Fill(1.0)),
-        volume_meter(volume, muted).width(Size::Fixed(210.0)),
+        volume_slider(node.id, volume, muted).width(Size::Fixed(220.0)),
         text(format!("{volume}%"))
             .mono()
             .label()
             .width(Size::Fixed(56.0)),
         button(if muted { "Unmute" } else { "Mute" })
             .secondary()
+            .key(format!("mute:{}", node.id))
             .width(Size::Fixed(86.0)),
     ])
     .gap(tokens::SPACE_MD)
@@ -242,7 +304,7 @@ fn card_row(card: &AudioCard) -> El {
     .radius(tokens::RADIUS_MD)
 }
 
-fn volume_meter(percent: u32, muted: bool) -> El {
+fn volume_slider(id: u32, percent: u32, muted: bool) -> El {
     let fill = if muted {
         tokens::TEXT_MUTED_FOREGROUND
     } else {
@@ -260,9 +322,28 @@ fn volume_meter(percent: u32, muted: bool) -> El {
             .width(Size::Fill(pct.min(1.0)))
             .fill(fill)
             .radius(tokens::RADIUS_PILL),
+        row([
+            spacer().width(Size::Fill(pct.min(1.0))),
+            El::new(Kind::Custom("slider-thumb"))
+                .width(Size::Fixed(14.0))
+                .height(Size::Fixed(14.0))
+                .fill(tokens::TEXT_FOREGROUND)
+                .stroke(tokens::BORDER)
+                .radius(tokens::RADIUS_PILL),
+            spacer().width(Size::Fill((1.0 - pct.min(1.0)).max(0.0))),
+        ])
+        .align(Align::Center)
+        .height(Size::Fixed(18.0))
+        .width(Size::Fill(1.0)),
     ])
-    .height(Size::Fixed(10.0))
+    .key(format!("volume:{id}"))
+    .focusable()
+    .height(Size::Fixed(18.0))
     .width(Size::Fill(1.0))
+}
+
+fn node_id_from_key(key: &str, prefix: &str) -> Option<u32> {
+    key.strip_prefix(prefix)?.parse().ok()
 }
 
 fn badge(label: impl Into<String>) -> El {

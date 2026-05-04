@@ -2,6 +2,7 @@
 name = "aetna-volume"
 version = "0.1.0"
 edition = "2024"
+default-run = "aetna-volume"
 
 [dependencies]
 aetna-core = { path = "../aetna/aetna.main/crates/aetna-core" }
