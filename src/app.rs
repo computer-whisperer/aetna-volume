@@ -131,27 +131,31 @@ impl VolumeApp {
         }
     }
 
-    fn handle_profile_event(&mut self, ev: ProfileEvent) {
-        match ev {
-            ProfileEvent::ToggleTrigger(card) => {
+    fn handle_profile_event(&mut self, event: &UiEvent, card_id: u32) {
+        let key = format!("profile:{card_id}");
+        let Some(action) = aetna_core::widgets::select::classify_event(event, &key) else {
+            return;
+        };
+        match action {
+            SelectAction::Toggle => {
                 let mut open = self.profile_dropdown_open.borrow_mut();
-                *open = if *open == Some(card) {
+                *open = if *open == Some(card_id) {
                     None
                 } else {
-                    Some(card)
+                    Some(card_id)
                 };
             }
-            ProfileEvent::Dismiss(_) => {
+            SelectAction::Dismiss => {
                 *self.profile_dropdown_open.borrow_mut() = None;
             }
-            ProfileEvent::SelectOption {
-                card,
-                profile_index,
-            } => {
+            SelectAction::Pick(value) => {
+                let Ok(profile_index) = value.parse::<u32>() else {
+                    return;
+                };
                 self.profile_overrides
                     .borrow_mut()
-                    .insert(card, profile_index);
-                self.backend.set_card_profile(card, profile_index);
+                    .insert(card_id, profile_index);
+                self.backend.set_card_profile(card_id, profile_index);
                 *self.profile_dropdown_open.borrow_mut() = None;
             }
         }
@@ -242,8 +246,8 @@ impl App for VolumeApp {
                     self.toggle_mute(id);
                 } else if let Some(id) = node_id_from_key(key, "default:") {
                     self.set_default(id);
-                } else if let Some(event) = parse_profile_event(key) {
-                    self.handle_profile_event(event);
+                } else if let Some(card_id) = card_id_for_profile_select(key) {
+                    self.handle_profile_event(&event, card_id);
                 } else if let Some(id) = node_id_from_key(key, "volume:") {
                     self.scrub_from_event(&event, id);
                 }
@@ -570,36 +574,15 @@ fn node_id_from_key(key: &str, prefix: &str) -> Option<u32> {
     key.strip_prefix(prefix)?.parse().ok()
 }
 
-/// Routed-key shape for the profile select. The trigger emits
-/// `profile:{card}`; the dropdown's dismiss scrim emits
-/// `profile:{card}:dismiss`; an option click emits
-/// `profile:{card}:option:{idx}` (per the `select_menu` convention in
-/// aetna-core).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProfileEvent {
-    ToggleTrigger(u32),
-    Dismiss(u32),
-    SelectOption { card: u32, profile_index: u32 },
-}
-
-fn parse_profile_event(key: &str) -> Option<ProfileEvent> {
+/// Match the per-card profile-select key shape (`profile:{card_id}`,
+/// plus `:dismiss` / `:option:{idx}` suffixes the popover layer adds)
+/// and pull the card id out so the routed event can be dispatched
+/// against the controlled select with a card-scoped key. Decoding the
+/// routed action is left to
+/// [`aetna_core::widgets::select::classify_event`].
+fn card_id_for_profile_select(key: &str) -> Option<u32> {
     let rest = key.strip_prefix("profile:")?;
-    match rest.split_once(':') {
-        None => Some(ProfileEvent::ToggleTrigger(rest.parse().ok()?)),
-        Some((card, suffix)) => {
-            let card = card.parse().ok()?;
-            if suffix == "dismiss" {
-                Some(ProfileEvent::Dismiss(card))
-            } else if let Some(idx) = suffix.strip_prefix("option:") {
-                Some(ProfileEvent::SelectOption {
-                    card,
-                    profile_index: idx.parse().ok()?,
-                })
-            } else {
-                None
-            }
-        }
-    }
+    rest.split(':').next()?.parse().ok()
 }
 
 pub fn slider_percent_from_x(rect: Rect, x: f32) -> u32 {
@@ -698,7 +681,8 @@ mod tests {
         assert_eq!(closed.children.len(), 1, "closed: just the main layer");
 
         // Open the dropdown for the first card.
-        app.handle_profile_event(ProfileEvent::ToggleTrigger(card_id));
+        let toggle = profile_click_event(card_id, "");
+        app.handle_profile_event(&toggle, card_id);
         let opened = app.build();
         assert_eq!(opened.children.len(), 2, "open: main + popover at the root");
         // Popover scrim's dismiss key matches the trigger key suffix.
@@ -710,35 +694,38 @@ mod tests {
         );
 
         // Toggling again closes.
-        app.handle_profile_event(ProfileEvent::ToggleTrigger(card_id));
+        app.handle_profile_event(&toggle, card_id);
         assert_eq!(app.build().children.len(), 1);
     }
 
     #[test]
-    fn parse_profile_event_decodes_trigger_dismiss_and_option() {
-        // Trigger click — the bare `profile:{card}` key emitted by the
-        // select_trigger.
-        assert_eq!(
-            parse_profile_event("profile:7"),
-            Some(ProfileEvent::ToggleTrigger(7))
-        );
-        // Click outside the dropdown — the popover dismiss scrim's
-        // routed key (`{key}:dismiss`).
-        assert_eq!(
-            parse_profile_event("profile:7:dismiss"),
-            Some(ProfileEvent::Dismiss(7))
-        );
-        // Click on an option — `{key}:option:{value}` from select_menu.
-        assert_eq!(
-            parse_profile_event("profile:7:option:3"),
-            Some(ProfileEvent::SelectOption {
-                card: 7,
-                profile_index: 3
-            })
-        );
-        // Unrelated keys (other widget routes, etc.) don't match.
-        assert_eq!(parse_profile_event("mute:7"), None);
-        assert_eq!(parse_profile_event("profile:abc"), None);
-        assert_eq!(parse_profile_event("profile:7:option:bad"), None);
+    fn card_id_for_profile_select_decodes_per_card_key() {
+        // The trigger key (`profile:{card}`), the dismiss scrim
+        // (`profile:{card}:dismiss`), and the option click
+        // (`profile:{card}:option:{idx}`) should all yield the same
+        // card id — `classify_event` then handles the action shape.
+        assert_eq!(card_id_for_profile_select("profile:7"), Some(7));
+        assert_eq!(card_id_for_profile_select("profile:7:dismiss"), Some(7));
+        assert_eq!(card_id_for_profile_select("profile:7:option:3"), Some(7));
+        // Unrelated keys (other widget routes) don't match.
+        assert_eq!(card_id_for_profile_select("mute:7"), None);
+        assert_eq!(card_id_for_profile_select("profile:abc"), None);
+    }
+
+    fn profile_click_event(card_id: u32, suffix: &str) -> UiEvent {
+        let key = if suffix.is_empty() {
+            format!("profile:{card_id}")
+        } else {
+            format!("profile:{card_id}:{suffix}")
+        };
+        UiEvent {
+            kind: UiEventKind::Click,
+            key: Some(key),
+            target: None,
+            pointer: None,
+            key_press: None,
+            text: None,
+            modifiers: Default::default(),
+        }
     }
 }
