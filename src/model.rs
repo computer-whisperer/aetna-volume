@@ -84,7 +84,6 @@ pub struct AudioNode {
     pub target: Option<String>,
     pub volume: Option<Volume>,
     pub is_default: bool,
-    pub monitor_stream_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,7 +123,6 @@ impl AudioSnapshot {
                         muted: false,
                     }),
                     is_default: true,
-                    monitor_stream_id: None,
                 },
                 AudioNode {
                     id: 56,
@@ -141,7 +139,6 @@ impl AudioSnapshot {
                         muted: false,
                     }),
                     is_default: false,
-                    monitor_stream_id: Some(56),
                 },
                 AudioNode {
                     id: 61,
@@ -158,7 +155,6 @@ impl AudioSnapshot {
                         muted: true,
                     }),
                     is_default: false,
-                    monitor_stream_id: Some(61),
                 },
                 AudioNode {
                     id: 77,
@@ -175,7 +171,6 @@ impl AudioSnapshot {
                         muted: false,
                     }),
                     is_default: true,
-                    monitor_stream_id: None,
                 },
             ],
             cards: vec![AudioCard {

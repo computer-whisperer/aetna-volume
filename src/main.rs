@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use aetna_core::*;
@@ -16,28 +17,46 @@ const SLIDER_TRACK_HEIGHT: f32 = 10.0;
 
 struct VolumeApp {
     backend: Box<dyn AudioBackend>,
-    snapshot: AudioSnapshot,
     active_tab: Tab,
-    volume_overrides: HashMap<u32, u32>,
-    levels: LevelService,
+    /// The latest snapshot, mirrored from the backend at the top of
+    /// every `build` so the UI tracks PipeWire registry changes within
+    /// one frame. Behind a `RefCell` because `App::build` is `&self`.
+    snapshot: RefCell<AudioSnapshot>,
+    /// Per-node optimistic overrides applied on top of the live
+    /// snapshot. Until the backend exposes a write path these are
+    /// purely cosmetic, but they keep slider drags and mute clicks
+    /// from flickering against snapshot updates.
+    volume_overrides: RefCell<HashMap<u32, u32>>,
+    mute_overrides: RefCell<HashMap<u32, bool>>,
+    levels: RefCell<LevelService>,
 }
 
 impl VolumeApp {
-    fn new(mut backend: Box<dyn AudioBackend>) -> Self {
+    fn new(backend: Box<dyn AudioBackend>) -> Self {
         let snapshot = backend.refresh();
         let mut levels = LevelService::new();
         levels.ensure_snapshot(&snapshot);
         Self {
             backend,
-            snapshot,
             active_tab: Tab::Playback,
-            volume_overrides: HashMap::new(),
-            levels,
+            snapshot: RefCell::new(snapshot),
+            volume_overrides: RefCell::new(HashMap::new()),
+            mute_overrides: RefCell::new(HashMap::new()),
+            levels: RefCell::new(levels),
         }
+    }
+
+    /// Pull the latest snapshot from the backend and reconcile meter
+    /// threads. Called once per frame from `build`.
+    fn sync_state(&self) {
+        let snapshot = self.backend.refresh();
+        self.levels.borrow_mut().ensure_snapshot(&snapshot);
+        *self.snapshot.borrow_mut() = snapshot;
     }
 
     fn percent_for(&self, node: &AudioNode) -> u32 {
         self.volume_overrides
+            .borrow()
             .get(&node.id)
             .copied()
             .or_else(|| node.volume.as_ref().map(Volume::percent))
@@ -45,58 +64,58 @@ impl VolumeApp {
     }
 
     fn muted_for(&self, node: &AudioNode) -> bool {
+        if let Some(muted) = self.mute_overrides.borrow().get(&node.id).copied() {
+            return muted;
+        }
         node.volume.as_ref().map(|v| v.muted).unwrap_or(false)
     }
 
-    fn scrub_from_event(&mut self, event: &UiEvent, id: u32) {
+    fn scrub_from_event(&self, event: &UiEvent, id: u32) {
         let (Some(target), Some((x, _))) = (&event.target, event.pointer) else {
             return;
         };
         let pct = slider_percent_from_x(target.rect, x);
-        self.volume_overrides.insert(id, pct);
-        let muted = self
-            .snapshot
-            .nodes
-            .iter()
-            .find(|node| node.id == id)
-            .and_then(|node| node.volume.as_ref())
-            .map(|v| v.muted)
-            .unwrap_or(false);
-        if let Some(node) = self.snapshot.node_mut(id) {
-            node.volume = Some(Volume::from_percent(pct, muted));
-        }
+        self.volume_overrides.borrow_mut().insert(id, pct);
     }
 
-    fn toggle_mute(&mut self, id: u32) {
-        if let Some(node) = self.snapshot.node_mut(id) {
-            let current = node.volume.clone().unwrap_or(Volume {
-                scalar: 1.0,
-                muted: false,
+    fn toggle_mute(&self, id: u32) {
+        let current = self
+            .mute_overrides
+            .borrow()
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| {
+                self.snapshot
+                    .borrow()
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == id)
+                    .and_then(|node| node.volume.as_ref())
+                    .map(|v| v.muted)
+                    .unwrap_or(false)
             });
-            node.volume = Some(Volume {
-                muted: !current.muted,
-                ..current
-            });
-        }
+        self.mute_overrides.borrow_mut().insert(id, !current);
     }
 }
 
 impl App for VolumeApp {
     fn build(&self) -> El {
+        self.sync_state();
+        let snapshot = self.snapshot.borrow();
         let content = match self.active_tab {
-            Tab::Configuration => configuration_panel(&self.snapshot.cards),
-            tab => node_panel(self.snapshot.nodes_for_tab(tab), tab, self),
+            Tab::Configuration => configuration_panel(&snapshot.cards),
+            tab => node_panel(snapshot.nodes_for_tab(tab), tab, self),
         };
 
         column([
-            header(&self.snapshot),
+            header(&snapshot),
             row([
                 sidebar(self.active_tab),
                 content.width(Size::Fill(1.0)).height(Size::Fill(1.0)),
             ])
             .gap(tokens::SPACE_LG)
             .height(Size::Fill(1.0)),
-            status_bar(&self.snapshot, self.levels.active_meter_count()),
+            status_bar(&snapshot, self.levels.borrow().active_meter_count()),
         ])
         .gap(tokens::SPACE_LG)
         .padding(tokens::SPACE_LG)
@@ -114,9 +133,11 @@ impl App for VolumeApp {
                 if let Some(tab) = Tab::ALL.into_iter().find(|tab| tab.key() == key) {
                     self.active_tab = tab;
                 } else if key == "refresh" {
-                    self.snapshot = self.backend.refresh();
-                    self.volume_overrides.clear();
-                    self.levels.ensure_snapshot(&self.snapshot);
+                    // Live snapshot updates are continuous, so the
+                    // button just clears optimistic overrides — the
+                    // next `build` re-pulls the snapshot anyway.
+                    self.volume_overrides.borrow_mut().clear();
+                    self.mute_overrides.borrow_mut().clear();
                 } else if let Some(id) = node_id_from_key(key, "mute:") {
                     self.toggle_mute(id);
                 } else if let Some(id) = node_id_from_key(key, "volume:") {
@@ -189,7 +210,7 @@ fn node_panel(nodes: Vec<&AudioNode>, tab: Tab, app: &VolumeApp) -> El {
                     node,
                     app.percent_for(node),
                     app.muted_for(node),
-                    app.levels.level_for(node.id),
+                    app.levels.borrow().level_for(node.id),
                 )
             })
             .collect()

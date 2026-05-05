@@ -1,7 +1,7 @@
 use aetna_volume::backend::{AudioBackend, pipewire_native::PipeWireBackend};
 
 fn main() {
-    let mut backend = PipeWireBackend::new();
+    let backend = PipeWireBackend::new();
     let snapshot = backend.refresh();
     println!(
         "server: {}",

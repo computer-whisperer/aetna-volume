@@ -4,10 +4,10 @@ use spa::param::format::{MediaSubtype, MediaType};
 use spa::param::format_utils;
 use spa::pod::Pod;
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
-    io::Read,
     mem,
-    process::{Child, Command, Stdio},
+    rc::Rc,
     sync::{
         Arc, Mutex, Once,
         atomic::{AtomicBool, Ordering},
@@ -89,8 +89,8 @@ impl LevelService {
             return;
         };
         let stop = Arc::new(AtomicBool::new(false));
-        let child = spawn_meter(node.id, route, self.levels.clone(), stop.clone());
-        self.meters.insert(node.id, MeterHandle { stop, child });
+        spawn_meter(node.id, route, self.levels.clone(), stop.clone());
+        self.meters.insert(node.id, MeterHandle { stop });
     }
 }
 
@@ -98,18 +98,12 @@ impl Drop for LevelService {
     fn drop(&mut self) {
         for meter in self.meters.values() {
             meter.stop.store(true, Ordering::Relaxed);
-            if let Some(child) = &meter.child
-                && let Ok(mut child) = child.lock()
-            {
-                let _ = child.kill();
-            }
         }
     }
 }
 
 struct MeterHandle {
     stop: Arc<AtomicBool>,
-    child: Option<Arc<Mutex<Child>>>,
 }
 
 struct MeterData {
@@ -124,28 +118,33 @@ struct MeterData {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MeterRoute {
-    PipeWire { capture_sink: bool },
-    PulseMonitor { stream_id: u32 },
+    /// Capture path that lets WirePlumber's policy auto-link us to a sink
+    /// monitor or a real source. Used for output devices, input devices,
+    /// and input streams.
+    AutoConnect { capture_sink: bool },
+    /// Capture path that bypasses WirePlumber and creates explicit
+    /// port-to-port links from the source node's outputs to our inputs.
+    /// Required for output streams, which the session manager will not
+    /// expose as a normal capture target.
+    LinkFromOutputs,
 }
 
 fn meter_route_for(node: &AudioNode) -> Option<MeterRoute> {
     match node.class {
         AudioClass::Device {
             direction: Direction::Output,
-        } => Some(MeterRoute::PipeWire { capture_sink: true }),
+        } => Some(MeterRoute::AutoConnect { capture_sink: true }),
         AudioClass::Device {
             direction: Direction::Input,
-        } => Some(MeterRoute::PipeWire {
+        } => Some(MeterRoute::AutoConnect {
             capture_sink: false,
         }),
         AudioClass::Stream {
             direction: Direction::Output,
-        } => node
-            .monitor_stream_id
-            .map(|stream_id| MeterRoute::PulseMonitor { stream_id }),
+        } => Some(MeterRoute::LinkFromOutputs),
         AudioClass::Stream {
             direction: Direction::Input,
-        } => Some(MeterRoute::PipeWire {
+        } => Some(MeterRoute::AutoConnect {
             capture_sink: false,
         }),
         _ => None,
@@ -157,38 +156,27 @@ fn spawn_meter(
     route: MeterRoute,
     levels: Arc<Mutex<HashMap<u32, NodeLevels>>>,
     stop: Arc<AtomicBool>,
-) -> Option<Arc<Mutex<Child>>> {
-    match route {
-        MeterRoute::PipeWire { capture_sink } => {
-            thread::Builder::new()
-                .name(format!("aetna-volume-meter-{node_id}"))
-                .spawn(move || {
-                    if let Err(err) = run_pipewire_meter(node_id, capture_sink, levels, stop) {
-                        eprintln!("aetna-volume: level meter for node {node_id} stopped: {err}");
-                    }
-                })
-                .expect("spawn PipeWire level meter");
-            None
-        }
-        MeterRoute::PulseMonitor { stream_id } => {
-            let child = spawn_pulse_meter_process(stream_id)
-                .map(|child| Arc::new(Mutex::new(child)))
-                .ok();
-            let child_for_thread = child.clone();
-            thread::Builder::new()
-                .name(format!("aetna-volume-pulse-meter-{node_id}"))
-                .spawn(move || {
-                    if let Some(child) = child_for_thread {
-                        run_pulse_meter(node_id, child, levels, stop);
-                    }
-                })
-                .expect("spawn Pulse monitor meter");
-            child
-        }
-    }
+) {
+    let thread_name = format!("aetna-volume-meter-{node_id}");
+    thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let result = match route {
+                MeterRoute::AutoConnect { capture_sink } => {
+                    run_pipewire_auto_meter(node_id, capture_sink, levels, stop)
+                }
+                MeterRoute::LinkFromOutputs => {
+                    run_pipewire_linked_meter(node_id, levels, stop)
+                }
+            };
+            if let Err(err) = result {
+                eprintln!("aetna-volume: level meter for node {node_id} stopped: {err}");
+            }
+        })
+        .expect("spawn PipeWire level meter");
 }
 
-fn run_pipewire_meter(
+fn run_pipewire_auto_meter(
     node_id: u32,
     capture_sink: bool,
     levels: Arc<Mutex<HashMap<u32, NodeLevels>>>,
@@ -286,52 +274,226 @@ fn run_pipewire_meter(
     Ok(())
 }
 
-fn spawn_pulse_meter_process(stream_id: u32) -> std::io::Result<Child> {
-    Command::new("parec")
-        .args([
-            "--raw",
-            "--format=float32le",
-            "--channels=2",
-            "--rate=48000",
-            "--device=@DEFAULT_MONITOR@",
-            "--latency-msec=50",
-            "--process-time-msec=25",
-            "--client-name=aetna-volume",
-            "--stream-name=aetna-volume-meter",
-            &format!("--monitor-stream={stream_id}"),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-}
-
-fn run_pulse_meter(
-    node_id: u32,
-    child: Arc<Mutex<Child>>,
+/// Capture an output stream by creating explicit pw_link objects from
+/// the source stream's output ports to our capture stream's input ports.
+///
+/// The session manager (WirePlumber) will not honour `target.object`
+/// pointed at a `Stream/Output/Audio` node — capture clients with no
+/// recognised target fall back to the default source (the user's mic).
+/// To monitor a single stream we open a capture without `AUTOCONNECT`,
+/// watch the registry until both sides have ports, then construct
+/// link-factory objects for each output→input pair.
+fn run_pipewire_linked_meter(
+    source_node_id: u32,
     levels: Arc<Mutex<HashMap<u32, NodeLevels>>>,
     stop: Arc<AtomicBool>,
-) {
-    let Some(mut stdout) = child.lock().ok().and_then(|mut child| child.stdout.take()) else {
+) -> Result<(), Box<dyn std::error::Error>> {
+    pipewire_init();
+
+    let mainloop = pw::main_loop::MainLoopRc::new(None)?;
+    let context = pw::context::ContextRc::new(&mainloop, None)?;
+    let core = context.connect_rc(None)?;
+    let registry = core.get_registry()?;
+
+    let props = properties! {
+        *pw::keys::APP_NAME => "aetna-volume",
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Capture",
+        *pw::keys::MEDIA_ROLE => "Music",
+        *pw::keys::NODE_NAME => format!("aetna-volume.meter.{source_node_id}"),
+    };
+
+    let stream = pw::stream::StreamBox::new(&core, "aetna-volume-meter", props)?;
+    let data = MeterData {
+        node_id: source_node_id,
+        format: Default::default(),
+        mainloop: mainloop.clone(),
+        levels,
+        stop,
+        smooth_peaks: Vec::new(),
+        smooth_rms: Vec::new(),
+    };
+
+    let _listener = stream
+        .add_local_listener_with_user_data(data)
+        .state_changed(|_, data, _, state| {
+            if let pw::stream::StreamState::Error(err) = state {
+                eprintln!(
+                    "aetna-volume: meter stream error for node {}: {err}",
+                    data.node_id
+                );
+                data.mainloop.quit();
+            }
+        })
+        .param_changed(|_, data, id, param| {
+            let Some(param) = param else {
+                return;
+            };
+            if id != pw::spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            let Ok((media_type, media_subtype)) = format_utils::parse_format(param) else {
+                return;
+            };
+            if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
+                return;
+            }
+            let _ = data.format.parse(param);
+        })
+        .process(|stream, data| {
+            if data.stop.load(Ordering::Relaxed) {
+                data.mainloop.quit();
+                return;
+            }
+            process_meter_buffer(stream, data);
+        })
+        .register()?;
+
+    // Lock the capture to stereo F32LE so our input ports exist before
+    // any peer negotiation. Without an explicit channel count the stream
+    // creates one mono input port and only the source's first channel
+    // ever reaches us — every output stream looks left-only.
+    // PipeWire inserts the necessary remix on the link side for sources
+    // with a different channel layout.
+    let mut audio_info = spa::param::audio::AudioInfoRaw::new();
+    audio_info.set_format(spa::param::audio::AudioFormat::F32LE);
+    audio_info.set_rate(48_000);
+    audio_info.set_channels(2);
+    let obj = pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: pw::spa::param::ParamType::EnumFormat.as_raw(),
+        properties: audio_info.into(),
+    };
+    let values = pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pw::spa::pod::Value::Object(obj),
+    )?
+    .0
+    .into_inner();
+    let mut params = [Pod::from_bytes(&values).ok_or("failed to build PipeWire format pod")?];
+
+    stream.connect(
+        spa::utils::Direction::Input,
+        None,
+        pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS,
+        &mut params,
+    )?;
+
+    let our_node_name = format!("aetna-volume.meter.{source_node_id}");
+    let linker = Rc::new(RefCell::new(LinkerState::default()));
+    let core_for_global = core.clone();
+    let linker_for_global = linker.clone();
+    let linker_for_remove = linker.clone();
+
+    let _registry_listener = registry
+        .add_listener_local()
+        .global(move |global| {
+            let Some(props) = global.props.as_ref() else {
+                return;
+            };
+            let props = props.as_ref();
+
+            let mut state = linker_for_global.borrow_mut();
+            match global.type_ {
+                pw::types::ObjectType::Node => {
+                    if prop(props, "node.name") == Some(our_node_name.as_str()) {
+                        state.our_node_id = Some(global.id);
+                    }
+                }
+                pw::types::ObjectType::Port => {
+                    let Some(node_id) =
+                        prop(props, "node.id").and_then(|s| s.parse::<u32>().ok())
+                    else {
+                        return;
+                    };
+                    let direction = prop(props, "port.direction").unwrap_or("");
+                    let is_output = direction == "out";
+                    state
+                        .ports_by_node
+                        .entry(node_id)
+                        .or_default()
+                        .push((global.id, is_output));
+                }
+                _ => return,
+            }
+            try_link(&core_for_global, &mut state, source_node_id);
+        })
+        .global_remove(move |id| {
+            let mut state = linker_for_remove.borrow_mut();
+            if state.our_node_id == Some(id) {
+                state.our_node_id = None;
+            }
+            for ports in state.ports_by_node.values_mut() {
+                ports.retain(|(port_id, _)| *port_id != id);
+            }
+            state
+                .links
+                .retain(|(out_port, in_port), _| *out_port != id && *in_port != id);
+        })
+        .register();
+
+    mainloop.run();
+    Ok(())
+}
+
+#[derive(Default)]
+struct LinkerState {
+    our_node_id: Option<u32>,
+    /// All port globals seen so far, keyed by their owning node id.
+    /// Each entry is `(port_id, is_output_direction)`.
+    ///
+    /// Caching every port (rather than filtering source-vs-ours at
+    /// arrival time) avoids a race where a Port global for our capture
+    /// arrives before the corresponding Node global — at that moment we
+    /// don't yet know `our_node_id`, so a directly-filtered version
+    /// would silently drop the port and never relink.
+    ports_by_node: HashMap<u32, Vec<(u32, bool)>>,
+    /// Existing links keyed by `(source_output_port, our_input_port)`.
+    /// Re-linking is idempotent against this map so late-arriving ports
+    /// (e.g. the right channel showing up after the left) get connected
+    /// as soon as both sides are present.
+    links: HashMap<(u32, u32), pw::link::Link>,
+}
+
+fn try_link(core: &pw::core::CoreRc, state: &mut LinkerState, source_node_id: u32) {
+    let Some(our_node_id) = state.our_node_id else {
         return;
     };
-    let mut smooth_peaks = Vec::new();
-    let mut smooth_rms = Vec::new();
-    let mut buf = vec![0_u8; 4096];
-    while !stop.load(Ordering::Relaxed) {
-        let Ok(read) = stdout.read(&mut buf) else {
-            break;
-        };
-        if read == 0 {
-            break;
+    let source_outputs: Vec<u32> = state
+        .ports_by_node
+        .get(&source_node_id)
+        .map(|ports| ports.iter().filter(|(_, out)| *out).map(|(id, _)| *id).collect())
+        .unwrap_or_default();
+    let our_inputs: Vec<u32> = state
+        .ports_by_node
+        .get(&our_node_id)
+        .map(|ports| ports.iter().filter(|(_, out)| !*out).map(|(id, _)| *id).collect())
+        .unwrap_or_default();
+    if source_outputs.is_empty() || our_inputs.is_empty() {
+        return;
+    }
+
+    for (output_port, input_port) in source_outputs.into_iter().zip(our_inputs.into_iter()) {
+        let pair = (output_port, input_port);
+        if state.links.contains_key(&pair) {
+            continue;
         }
-        publish_level_samples(
-            node_id,
-            &buf[..read],
-            2,
-            &levels,
-            &mut smooth_peaks,
-            &mut smooth_rms,
-        );
+        let link_props = properties! {
+            "link.output.node" => source_node_id.to_string(),
+            "link.output.port" => output_port.to_string(),
+            "link.input.node" => our_node_id.to_string(),
+            "link.input.port" => input_port.to_string(),
+            "object.linger" => "false",
+        };
+        match core.create_object::<pw::link::Link>("link-factory", &link_props) {
+            Ok(link) => {
+                state.links.insert(pair, link);
+            }
+            Err(err) => eprintln!(
+                "aetna-volume: failed to link {source_node_id}:{output_port} -> \
+                 {our_node_id}:{input_port}: {err}"
+            ),
+        }
     }
 }
 
@@ -352,14 +514,14 @@ fn process_meter_buffer(stream: &pw::stream::Stream, data: &mut MeterData) {
     let Some(samples) = datas[0].data() else {
         return;
     };
-    let sample_count = (bytes / mem::size_of::<f32>()).min(samples.len() / 4);
-    if sample_count == 0 {
+    let usable = bytes.min(samples.len()) / mem::size_of::<f32>() * mem::size_of::<f32>();
+    if usable == 0 {
         return;
     }
 
     publish_level_samples(
         data.node_id,
-        &samples[..bytes.min(samples.len())],
+        &samples[..usable],
         channels,
         &data.levels,
         &mut data.smooth_peaks,
@@ -443,6 +605,12 @@ fn pipewire_init() {
     INIT.call_once(pw::init);
 }
 
+fn prop<'a>(props: &'a pw::spa::utils::dict::DictRef, key: &str) -> Option<&'a str> {
+    props
+        .iter()
+        .find_map(|(k, v)| if k == key { Some(v) } else { None })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,35 +628,26 @@ mod tests {
         let output_device = test_node(AudioClass::Device {
             direction: Direction::Output,
         });
-        let mut output_stream = test_node(AudioClass::Stream {
+        let output_stream = test_node(AudioClass::Stream {
             direction: Direction::Output,
         });
-        output_stream.monitor_stream_id = Some(42);
         let input_device = test_node(AudioClass::Device {
             direction: Direction::Input,
         });
         assert_eq!(
             meter_route_for(&output_device),
-            Some(MeterRoute::PipeWire { capture_sink: true })
+            Some(MeterRoute::AutoConnect { capture_sink: true })
         );
         assert_eq!(
             meter_route_for(&output_stream),
-            Some(MeterRoute::PulseMonitor { stream_id: 42 })
+            Some(MeterRoute::LinkFromOutputs)
         );
         assert_eq!(
             meter_route_for(&input_device),
-            Some(MeterRoute::PipeWire {
+            Some(MeterRoute::AutoConnect {
                 capture_sink: false
             })
         );
-    }
-
-    #[test]
-    fn output_stream_without_pulse_monitor_id_is_not_metered_from_sink_mix() {
-        let output_stream = test_node(AudioClass::Stream {
-            direction: Direction::Output,
-        });
-        assert_eq!(meter_route_for(&output_stream), None);
     }
 
     fn test_node(class: AudioClass) -> AudioNode {
@@ -502,7 +661,6 @@ mod tests {
             target: None,
             volume: None,
             is_default: false,
-            monitor_stream_id: None,
         }
     }
 }
