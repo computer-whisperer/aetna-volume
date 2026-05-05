@@ -6,8 +6,7 @@ use aetna_core::*;
 use crate::backend::AudioBackend;
 use crate::levels::{LevelService, NodeLevels};
 use crate::model::{
-    AudioCard, AudioClass, AudioNode, AudioProfile, AudioSnapshot, Direction, ProfileAvailability,
-    Tab, Volume,
+    AudioCard, AudioClass, AudioNode, AudioSnapshot, Direction, ProfileAvailability, Tab, Volume,
 };
 
 pub const MAX_VOLUME_PERCENT: u32 = 150;
@@ -29,6 +28,10 @@ pub struct VolumeApp {
     /// emit a `Profile` param event back, so we track the user's pick
     /// locally to keep the highlight responsive.
     pub profile_overrides: RefCell<HashMap<u32, u32>>,
+    /// Which card's profile dropdown is currently open. Single shared
+    /// slot — only one menu can be open at a time and the click-outside
+    /// scrim closes it before another can open.
+    pub profile_dropdown_open: RefCell<Option<u32>>,
     pub levels: RefCell<LevelService>,
 }
 
@@ -44,6 +47,7 @@ impl VolumeApp {
             volume_overrides: RefCell::new(HashMap::new()),
             mute_overrides: RefCell::new(HashMap::new()),
             profile_overrides: RefCell::new(HashMap::new()),
+            profile_dropdown_open: RefCell::new(None),
             levels: RefCell::new(levels),
         }
     }
@@ -127,6 +131,28 @@ impl VolumeApp {
         }
     }
 
+    fn handle_profile_event(&mut self, ev: ProfileEvent) {
+        match ev {
+            ProfileEvent::ToggleTrigger(card) => {
+                let mut open = self.profile_dropdown_open.borrow_mut();
+                *open = if *open == Some(card) { None } else { Some(card) };
+            }
+            ProfileEvent::Dismiss(_) => {
+                *self.profile_dropdown_open.borrow_mut() = None;
+            }
+            ProfileEvent::SelectOption {
+                card,
+                profile_index,
+            } => {
+                self.profile_overrides
+                    .borrow_mut()
+                    .insert(card, profile_index);
+                self.backend.set_card_profile(card, profile_index);
+                *self.profile_dropdown_open.borrow_mut() = None;
+            }
+        }
+    }
+
     fn toggle_mute(&self, id: u32) {
         let current = self
             .mute_overrides
@@ -158,7 +184,7 @@ impl App for VolumeApp {
             tab => node_panel(snapshot.nodes_for_tab(tab), tab, self),
         };
 
-        column([
+        let main = column([
             header(&snapshot),
             tab_bar(self.active_tab),
             content.width(Size::Fill(1.0)).height(Size::Fill(1.0)),
@@ -168,7 +194,33 @@ impl App for VolumeApp {
         .padding(tokens::SPACE_LG)
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))
-        .fill(tokens::BG_APP)
+        .fill(tokens::BG_APP);
+
+        // Profile select dropdown — popovers compose at the root of the
+        // El tree (see aetna_core widgets::popover docs), so the menu
+        // for whichever card is currently open is a sibling of the main
+        // column. Only the configuration tab can open one, and only one
+        // can be open at a time.
+        let mut layers: Vec<El> = vec![main];
+        if self.active_tab == Tab::Configuration
+            && let Some(card_id) = *self.profile_dropdown_open.borrow()
+            && let Some(card) = snapshot.cards.iter().find(|c| c.id == card_id)
+        {
+            let options: Vec<(String, String)> = card
+                .profiles
+                .iter()
+                .map(|p| {
+                    let label = if p.available == ProfileAvailability::No {
+                        format!("{} · unavailable", p.description)
+                    } else {
+                        p.description.clone()
+                    };
+                    (p.index.to_string(), label)
+                })
+                .collect();
+            layers.push(select_menu(format!("profile:{card_id}"), options));
+        }
+        stack(layers).fill_size()
     }
 
     fn on_event(&mut self, event: UiEvent) {
@@ -186,11 +238,8 @@ impl App for VolumeApp {
                     self.toggle_mute(id);
                 } else if let Some(id) = node_id_from_key(key, "default:") {
                     self.set_default(id);
-                } else if let Some((card_id, profile_index)) = profile_key(key) {
-                    self.profile_overrides
-                        .borrow_mut()
-                        .insert(card_id, profile_index);
-                    self.backend.set_card_profile(card_id, profile_index);
+                } else if let Some(event) = parse_profile_event(key) {
+                    self.handle_profile_event(event);
                 } else if let Some(id) = node_id_from_key(key, "volume:") {
                     self.scrub_from_event(&event, id);
                 }
@@ -396,51 +445,32 @@ fn card_row(card: &AudioCard, active_profile: Option<u32>) -> El {
         ])
         .gap(tokens::SPACE_XS)
         .width(Size::Fill(1.0)),
-        text(active_label).caption().muted(),
     ])
     .gap(tokens::SPACE_MD)
     .align(Align::Center);
 
-    let profile_rows: Vec<El> = if card.profiles.is_empty() {
-        vec![text("No profiles enumerated yet.").caption().muted()]
+    let profile_picker: El = if card.profiles.is_empty() {
+        text("No profiles enumerated yet.").caption().muted()
     } else {
-        card.profiles
-            .iter()
-            .map(|profile| profile_row(card.id, profile, active_profile))
-            .collect()
+        select_trigger(format!("profile:{}", card.id), active_label).width(Size::Fill(1.0))
     };
 
-    column([header, column(profile_rows).gap(tokens::SPACE_XS)])
+    column([
+        header,
+        row([
+            text("Profile").label().muted().width(Size::Fixed(80.0)),
+            profile_picker,
+        ])
         .gap(tokens::SPACE_MD)
-        .padding(tokens::SPACE_MD)
-        .width(Size::Fill(1.0))
-        .fill(tokens::BG_CARD)
-        .stroke(tokens::BORDER)
-        .radius(tokens::RADIUS_MD)
-}
-
-fn profile_row(card_id: u32, profile: &AudioProfile, active: Option<u32>) -> El {
-    let is_active = active == Some(profile.index);
-    let unavailable = profile.available == ProfileAvailability::No;
-    let label = if unavailable {
-        format!("{} · unavailable", profile.description)
-    } else {
-        profile.description.clone()
-    };
-    let mut btn = button(label)
-        .key(format!("profile:{card_id}:{idx}", idx = profile.index))
-        .width(Size::Fill(1.0));
-    btn = if is_active {
-        btn.primary()
-    } else if unavailable {
-        // Outline border with muted text so the row reads as disabled
-        // but still occupies a button-shaped slot. Plain ghost dropped
-        // the surface entirely and the row looked like missing UI.
-        btn.outline().text_color(tokens::TEXT_MUTED_FOREGROUND)
-    } else {
-        btn.secondary()
-    };
-    btn
+        .align(Align::Center)
+        .width(Size::Fill(1.0)),
+    ])
+    .gap(tokens::SPACE_MD)
+    .padding(tokens::SPACE_MD)
+    .width(Size::Fill(1.0))
+    .fill(tokens::BG_CARD)
+    .stroke(tokens::BORDER)
+    .radius(tokens::RADIUS_MD)
 }
 
 fn volume_slider(id: u32, percent: u32, muted: bool) -> El {
@@ -536,10 +566,36 @@ fn node_id_from_key(key: &str, prefix: &str) -> Option<u32> {
     key.strip_prefix(prefix)?.parse().ok()
 }
 
-fn profile_key(key: &str) -> Option<(u32, u32)> {
+/// Routed-key shape for the profile select. The trigger emits
+/// `profile:{card}`; the dropdown's dismiss scrim emits
+/// `profile:{card}:dismiss`; an option click emits
+/// `profile:{card}:option:{idx}` (per the `select_menu` convention in
+/// aetna-core).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileEvent {
+    ToggleTrigger(u32),
+    Dismiss(u32),
+    SelectOption { card: u32, profile_index: u32 },
+}
+
+fn parse_profile_event(key: &str) -> Option<ProfileEvent> {
     let rest = key.strip_prefix("profile:")?;
-    let (card, index) = rest.split_once(':')?;
-    Some((card.parse().ok()?, index.parse().ok()?))
+    match rest.split_once(':') {
+        None => Some(ProfileEvent::ToggleTrigger(rest.parse().ok()?)),
+        Some((card, suffix)) => {
+            let card = card.parse().ok()?;
+            if suffix == "dismiss" {
+                Some(ProfileEvent::Dismiss(card))
+            } else if let Some(idx) = suffix.strip_prefix("option:") {
+                Some(ProfileEvent::SelectOption {
+                    card,
+                    profile_index: idx.parse().ok()?,
+                })
+            } else {
+                None
+            }
+        }
+    }
 }
 
 pub fn slider_percent_from_x(rect: Rect, x: f32) -> u32 {
@@ -626,5 +682,73 @@ mod tests {
         assert_eq!(slider_percent_from_x(rect, left + usable), 150);
         assert_eq!(slider_percent_from_x(rect, rect.x - 30.0), 0);
         assert_eq!(slider_percent_from_x(rect, rect.x + rect.w + 30.0), 150);
+    }
+
+    #[test]
+    fn open_dropdown_inserts_popover_layer_at_root() {
+        // Smoke test for the open-state path: when a card's dropdown
+        // is open, `build()` adds a select_menu sibling next to the
+        // main column. Closed-state regressions show up as the popover
+        // disappearing from the tree.
+        use crate::backend::DemoBackend;
+        let mut app = VolumeApp::new(Box::new(DemoBackend)).with_active_tab(Tab::Configuration);
+        let card_id = app
+            .snapshot
+            .borrow()
+            .cards
+            .first()
+            .map(|c| c.id)
+            .expect("DemoBackend exposes at least one card");
+        // Closed: only the main column at the root.
+        let closed = app.build();
+        assert_eq!(closed.children.len(), 1, "closed: just the main layer");
+
+        // Open the dropdown for the first card.
+        app.handle_profile_event(ProfileEvent::ToggleTrigger(card_id));
+        let opened = app.build();
+        assert_eq!(
+            opened.children.len(),
+            2,
+            "open: main + popover at the root"
+        );
+        // Popover scrim's dismiss key matches the trigger key suffix.
+        let popover = &opened.children[1];
+        let scrim = &popover.children[0];
+        assert_eq!(
+            scrim.key.as_deref(),
+            Some(format!("profile:{card_id}:dismiss").as_str())
+        );
+
+        // Toggling again closes.
+        app.handle_profile_event(ProfileEvent::ToggleTrigger(card_id));
+        assert_eq!(app.build().children.len(), 1);
+    }
+
+    #[test]
+    fn parse_profile_event_decodes_trigger_dismiss_and_option() {
+        // Trigger click — the bare `profile:{card}` key emitted by the
+        // select_trigger.
+        assert_eq!(
+            parse_profile_event("profile:7"),
+            Some(ProfileEvent::ToggleTrigger(7))
+        );
+        // Click outside the dropdown — the popover dismiss scrim's
+        // routed key (`{key}:dismiss`).
+        assert_eq!(
+            parse_profile_event("profile:7:dismiss"),
+            Some(ProfileEvent::Dismiss(7))
+        );
+        // Click on an option — `{key}:option:{value}` from select_menu.
+        assert_eq!(
+            parse_profile_event("profile:7:option:3"),
+            Some(ProfileEvent::SelectOption {
+                card: 7,
+                profile_index: 3
+            })
+        );
+        // Unrelated keys (other widget routes, etc.) don't match.
+        assert_eq!(parse_profile_event("mute:7"), None);
+        assert_eq!(parse_profile_event("profile:abc"), None);
+        assert_eq!(parse_profile_event("profile:7:option:bad"), None);
     }
 }
