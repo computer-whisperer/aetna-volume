@@ -68,7 +68,7 @@ impl<A: App> ApplicationHandler for VolumeHost<A> {
             ));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance
             .create_surface(window.clone())
             .expect("create surface");
@@ -80,15 +80,14 @@ impl<A: App> ApplicationHandler for VolumeHost<A> {
         }))
         .expect("no compatible adapter");
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("aetna_volume::device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("aetna_volume::device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
         .expect("request_device");
 
         let size = window.inner_size();
@@ -247,13 +246,15 @@ impl<A: App> ApplicationHandler for VolumeHost<A> {
 
                     WindowEvent::RedrawRequested => {
                         let frame = match gfx.surface.get_current_texture() {
-                            Ok(frame) => frame,
-                            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                            wgpu::CurrentSurfaceTexture::Success(frame)
+                            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+                            wgpu::CurrentSurfaceTexture::Lost
+                            | wgpu::CurrentSurfaceTexture::Outdated => {
                                 gfx.surface.configure(&gfx.device, &gfx.config);
                                 return;
                             }
-                            Err(error) => {
-                                eprintln!("surface error: {error}");
+                            other => {
+                                eprintln!("surface unavailable: {other:?}");
                                 return;
                             }
                         };
