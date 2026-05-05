@@ -1,6 +1,6 @@
 use anyhow::Result;
 use pipewire as pw;
-use pw::spa::pod::{Object, Property, Value};
+use pw::spa::pod::{Object, Property, Value, ValueArray};
 use pw::spa::{
     param::ParamType,
     utils::SpaTypes,
@@ -15,7 +15,7 @@ use std::{
 };
 
 use crate::backend::AudioBackend;
-use crate::model::{AudioCard, AudioClass, AudioNode, AudioSnapshot, Direction};
+use crate::model::{AudioCard, AudioClass, AudioNode, AudioSnapshot, Direction, Volume};
 
 /// Commands sent from the main thread to the PipeWire backend thread
 /// over [`pw::channel`] (loop-integrated, fires the receiver callback
@@ -129,16 +129,29 @@ fn run_backend_loop(
     let core = context.connect_rc(None)?;
     let registry = core.get_registry_rc()?;
 
-    // Per-node Node proxies, populated as we see globals and dropped
-    // as they go away. Used by the command receiver to issue
-    // `set_param` calls for mute / volume.
-    let proxies: Rc<RefCell<HashMap<u32, pw::node::Node>>> =
+    // Per-node Node proxies (and their props listeners), populated as
+    // we see globals and dropped as they go away. The proxy is used by
+    // the command receiver to issue `set_param` calls for mute /
+    // volume; the listener funnels Props parameter changes back into
+    // the snapshot so the UI reflects real PipeWire state.
+    let proxies: Rc<RefCell<HashMap<u32, NodeEntry>>> =
         Rc::new(RefCell::new(HashMap::new()));
+
+    // Per-node channel count, learned from `channelVolumes` arrays in
+    // the Props events. Required when writing volume so we can send a
+    // correctly-sized `channelVolumes` array — the canonical prop that
+    // pavucontrol and other PipeWire-aware tools also use. Without
+    // this, writing master `volume` instead would stack
+    // multiplicatively against any channel-level setting that already
+    // exists, producing surprising audible behavior.
+    let channels: Rc<RefCell<HashMap<u32, usize>>> = Rc::new(RefCell::new(HashMap::new()));
 
     let snapshot_for_global = snapshot.clone();
     let snapshot_for_remove = snapshot.clone();
     let proxies_for_global = proxies.clone();
     let proxies_for_remove = proxies.clone();
+    let channels_for_global = channels.clone();
+    let channels_for_remove = channels.clone();
     let registry_for_bind = registry.clone();
 
     let _registry_listener = registry
@@ -162,15 +175,56 @@ fn run_backend_loop(
                         return;
                     }
                 }
-                match registry_for_bind.bind::<pw::node::Node, _>(global) {
-                    Ok(node) => {
-                        proxies_for_global.borrow_mut().insert(global.id, node);
+                let node_id = global.id;
+                let node = match registry_for_bind.bind::<pw::node::Node, _>(global) {
+                    Ok(node) => node,
+                    Err(err) => {
+                        eprintln!("aetna-volume: failed to bind node {node_id}: {err}");
+                        return;
                     }
-                    Err(err) => eprintln!(
-                        "aetna-volume: failed to bind node {}: {err}",
-                        global.id
-                    ),
-                }
+                };
+                let snapshot_for_props = snapshot_for_global.clone();
+                let channels_for_props = channels_for_global.clone();
+                let listener = node
+                    .add_listener_local()
+                    .param(move |_seq, id, _index, _next, param| {
+                        if id != ParamType::Props {
+                            return;
+                        }
+                        let Some(param) = param else {
+                            return;
+                        };
+                        let decoded = decode_props(param.as_bytes());
+                        if let Some(count) = decoded.channel_count {
+                            channels_for_props.borrow_mut().insert(node_id, count);
+                        }
+                        if decoded.mute.is_none() && decoded.scalar.is_none() {
+                            return;
+                        }
+                        if let Ok(mut snap) = snapshot_for_props.lock() {
+                            if let Some(node) =
+                                snap.nodes.iter_mut().find(|n| n.id == node_id)
+                            {
+                                let current = node.volume.clone().unwrap_or(Volume {
+                                    scalar: 1.0,
+                                    muted: false,
+                                });
+                                node.volume = Some(Volume {
+                                    scalar: decoded.scalar.unwrap_or(current.scalar),
+                                    muted: decoded.mute.unwrap_or(current.muted),
+                                });
+                            }
+                        }
+                    })
+                    .register();
+                node.subscribe_params(&[ParamType::Props]);
+                proxies_for_global.borrow_mut().insert(
+                    node_id,
+                    NodeEntry {
+                        proxy: node,
+                        _listener: listener,
+                    },
+                );
             }
         })
         .global_remove(move |id| {
@@ -179,10 +233,12 @@ fn run_backend_loop(
                 snap.cards.retain(|c| c.id != id);
             }
             proxies_for_remove.borrow_mut().remove(&id);
+            channels_for_remove.borrow_mut().remove(&id);
         })
         .register();
 
     let proxies_for_commands = proxies.clone();
+    let channels_for_commands = channels.clone();
     let mainloop_for_quit = mainloop.clone();
     let _commands_attached = commands_rx.attach(mainloop.loop_(), move |cmd| match cmd {
         BackendCommand::Quit => mainloop_for_quit.quit(),
@@ -190,7 +246,8 @@ fn run_backend_loop(
             apply_mute(&proxies_for_commands.borrow(), node_id, muted);
         }
         BackendCommand::SetVolume { node_id, scalar } => {
-            apply_volume(&proxies_for_commands.borrow(), node_id, scalar);
+            let count = channels_for_commands.borrow().get(&node_id).copied();
+            apply_volume(&proxies_for_commands.borrow(), node_id, scalar, count);
         }
     });
 
@@ -211,8 +268,13 @@ fn run_backend_loop(
     Ok(())
 }
 
-fn apply_mute(proxies: &HashMap<u32, pw::node::Node>, node_id: u32, muted: bool) {
-    let Some(node) = proxies.get(&node_id) else {
+struct NodeEntry {
+    proxy: pw::node::Node,
+    _listener: pw::node::NodeListener,
+}
+
+fn apply_mute(proxies: &HashMap<u32, NodeEntry>, node_id: u32, muted: bool) {
+    let Some(entry) = proxies.get(&node_id) else {
         return;
     };
     let pod = match build_props_pod(vec![Property::new(
@@ -229,17 +291,32 @@ fn apply_mute(proxies: &HashMap<u32, pw::node::Node>, node_id: u32, muted: bool)
         eprintln!("aetna-volume: built invalid mute pod for {node_id}");
         return;
     };
-    node.set_param(ParamType::Props, 0, pod);
+    entry.proxy.set_param(ParamType::Props, 0, pod);
 }
 
-fn apply_volume(proxies: &HashMap<u32, pw::node::Node>, node_id: u32, scalar: f32) {
-    let Some(node) = proxies.get(&node_id) else {
+fn apply_volume(
+    proxies: &HashMap<u32, NodeEntry>,
+    node_id: u32,
+    scalar: f32,
+    channels: Option<usize>,
+) {
+    let Some(entry) = proxies.get(&node_id) else {
         return;
     };
-    let pod = match build_props_pod(vec![Property::new(
-        pw::spa::sys::SPA_PROP_volume,
-        Value::Float(scalar.clamp(0.0, 1.5)),
-    )]) {
+    let scalar = scalar.clamp(0.0, 1.5);
+    // Prefer `channelVolumes` when we know the node's channel count
+    // — that's the prop pavucontrol and the rest of the PipeWire
+    // ecosystem read and write, so writes here stay in lock-step with
+    // them. Fall back to master `volume` only when we haven't seen a
+    // Props event yet (rare, and corrects itself on the next event).
+    let property = match channels {
+        Some(n) if n > 0 => Property::new(
+            pw::spa::sys::SPA_PROP_channelVolumes,
+            Value::ValueArray(ValueArray::Float(vec![scalar; n])),
+        ),
+        _ => Property::new(pw::spa::sys::SPA_PROP_volume, Value::Float(scalar)),
+    };
+    let pod = match build_props_pod(vec![property]) {
         Ok(bytes) => bytes,
         Err(err) => {
             eprintln!("aetna-volume: failed to build volume pod for {node_id}: {err}");
@@ -250,7 +327,59 @@ fn apply_volume(proxies: &HashMap<u32, pw::node::Node>, node_id: u32, scalar: f3
         eprintln!("aetna-volume: built invalid volume pod for {node_id}");
         return;
     };
-    node.set_param(ParamType::Props, 0, pod);
+    entry.proxy.set_param(ParamType::Props, 0, pod);
+}
+
+struct DecodedProps {
+    mute: Option<bool>,
+    /// Either the first channel volume (preferred — that's what
+    /// pavucontrol displays and what we want lock-step with) or the
+    /// master volume as a fallback.
+    scalar: Option<f32>,
+    /// The length of the `channelVolumes` array, used by
+    /// `apply_volume` to write a correctly-sized array back.
+    channel_count: Option<usize>,
+}
+
+fn decode_props(bytes: &[u8]) -> DecodedProps {
+    let mut decoded = DecodedProps {
+        mute: None,
+        scalar: None,
+        channel_count: None,
+    };
+    let Ok((_, value)) =
+        pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(bytes)
+    else {
+        return decoded;
+    };
+    let Value::Object(obj) = value else {
+        return decoded;
+    };
+    let mut master = None;
+    let mut channel_first = None;
+    for prop in &obj.properties {
+        match prop.key {
+            k if k == pw::spa::sys::SPA_PROP_mute => {
+                if let Value::Bool(b) = prop.value {
+                    decoded.mute = Some(b);
+                }
+            }
+            k if k == pw::spa::sys::SPA_PROP_volume => {
+                if let Value::Float(f) = prop.value {
+                    master = Some(f);
+                }
+            }
+            k if k == pw::spa::sys::SPA_PROP_channelVolumes => {
+                if let Value::ValueArray(ValueArray::Float(arr)) = &prop.value {
+                    decoded.channel_count = Some(arr.len());
+                    channel_first = arr.first().copied();
+                }
+            }
+            _ => {}
+        }
+    }
+    decoded.scalar = channel_first.or(master);
+    decoded
 }
 
 fn build_props_pod(properties: Vec<Property>) -> Result<Vec<u8>> {

@@ -55,19 +55,33 @@ impl VolumeApp {
     }
 
     fn percent_for(&self, node: &AudioNode) -> u32 {
-        self.volume_overrides
-            .borrow()
-            .get(&node.id)
-            .copied()
-            .or_else(|| node.volume.as_ref().map(Volume::percent))
-            .unwrap_or(100)
+        let snapshot_pct = node.volume.as_ref().map(Volume::percent);
+        let override_pct = self.volume_overrides.borrow().get(&node.id).copied();
+        match (override_pct, snapshot_pct) {
+            // PipeWire has caught up to (or moved past) our optimistic
+            // value — drop the override so external changes flow.
+            (Some(o), Some(s)) if o.abs_diff(s) <= 1 => {
+                self.volume_overrides.borrow_mut().remove(&node.id);
+                s
+            }
+            (Some(o), _) => o,
+            (None, Some(s)) => s,
+            (None, None) => 100,
+        }
     }
 
     fn muted_for(&self, node: &AudioNode) -> bool {
-        if let Some(muted) = self.mute_overrides.borrow().get(&node.id).copied() {
-            return muted;
+        let snapshot_mute = node.volume.as_ref().map(|v| v.muted);
+        let override_mute = self.mute_overrides.borrow().get(&node.id).copied();
+        match (override_mute, snapshot_mute) {
+            (Some(o), Some(s)) if o == s => {
+                self.mute_overrides.borrow_mut().remove(&node.id);
+                s
+            }
+            (Some(o), _) => o,
+            (None, Some(s)) => s,
+            (None, None) => false,
         }
-        node.volume.as_ref().map(|v| v.muted).unwrap_or(false)
     }
 
     fn scrub_from_event(&self, event: &UiEvent, id: u32) {
