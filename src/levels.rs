@@ -165,9 +165,7 @@ fn spawn_meter(
                 MeterRoute::AutoConnect { capture_sink } => {
                     run_pipewire_auto_meter(node_id, capture_sink, levels, stop)
                 }
-                MeterRoute::LinkFromOutputs => {
-                    run_pipewire_linked_meter(node_id, levels, stop)
-                }
+                MeterRoute::LinkFromOutputs => run_pipewire_linked_meter(node_id, levels, stop),
             };
             if let Err(err) = result {
                 eprintln!("aetna-volume: level meter for node {node_id} stopped: {err}");
@@ -401,8 +399,7 @@ fn run_pipewire_linked_meter(
                     }
                 }
                 pw::types::ObjectType::Port => {
-                    let Some(node_id) =
-                        prop(props, "node.id").and_then(|s| s.parse::<u32>().ok())
+                    let Some(node_id) = prop(props, "node.id").and_then(|s| s.parse::<u32>().ok())
                     else {
                         return;
                     };
@@ -462,12 +459,24 @@ fn try_link(core: &pw::core::CoreRc, state: &mut LinkerState, source_node_id: u3
     let source_outputs: Vec<u32> = state
         .ports_by_node
         .get(&source_node_id)
-        .map(|ports| ports.iter().filter(|(_, out)| *out).map(|(id, _)| *id).collect())
+        .map(|ports| {
+            ports
+                .iter()
+                .filter(|(_, out)| *out)
+                .map(|(id, _)| *id)
+                .collect()
+        })
         .unwrap_or_default();
     let our_inputs: Vec<u32> = state
         .ports_by_node
         .get(&our_node_id)
-        .map(|ports| ports.iter().filter(|(_, out)| !*out).map(|(id, _)| *id).collect())
+        .map(|ports| {
+            ports
+                .iter()
+                .filter(|(_, out)| !*out)
+                .map(|(id, _)| *id)
+                .collect()
+        })
         .unwrap_or_default();
     if source_outputs.is_empty() || our_inputs.is_empty() {
         return;
@@ -660,7 +669,6 @@ mod tests {
             media_name: None,
             target: None,
             volume: None,
-            is_default: false,
         }
     }
 }

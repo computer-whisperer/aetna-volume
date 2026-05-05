@@ -25,6 +25,17 @@ pub trait AudioBackend {
     fn set_volume(&self, node_id: u32, scalar: f32) {
         let _ = (node_id, scalar);
     }
+
+    /// Make the named node the default audio sink. The name is the
+    /// PipeWire `node.name` property — see [`crate::model::AudioNode`].
+    fn set_default_sink(&self, node_name: &str) {
+        let _ = node_name;
+    }
+
+    /// Make the named node the default audio source.
+    fn set_default_source(&self, node_name: &str) {
+        let _ = node_name;
+    }
 }
 
 #[derive(Default)]

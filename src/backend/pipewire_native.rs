@@ -1,10 +1,7 @@
 use anyhow::Result;
 use pipewire as pw;
 use pw::spa::pod::{Object, Property, Value, ValueArray};
-use pw::spa::{
-    param::ParamType,
-    utils::SpaTypes,
-};
+use pw::spa::{param::ParamType, utils::SpaTypes};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -23,6 +20,8 @@ use crate::model::{AudioCard, AudioClass, AudioNode, AudioSnapshot, Direction, V
 enum BackendCommand {
     SetMute { node_id: u32, muted: bool },
     SetVolume { node_id: u32, scalar: f32 },
+    SetDefaultSink { node_name: String },
+    SetDefaultSource { node_name: String },
     Quit,
 }
 
@@ -52,11 +51,9 @@ impl PipeWireBackend {
         let thread = thread::Builder::new()
             .name("aetna-volume-pipewire".into())
             .spawn(move || {
-                if let Err(err) = run_backend_loop(
-                    snapshot_for_thread.clone(),
-                    commands_rx,
-                    &ready_for_thread,
-                ) {
+                if let Err(err) =
+                    run_backend_loop(snapshot_for_thread.clone(), commands_rx, &ready_for_thread)
+                {
                     eprintln!("aetna-volume: PipeWire backend stopped: {err}");
                     if let Ok(mut snap) = snapshot_for_thread.lock() {
                         snap.error = Some(err.to_string());
@@ -98,10 +95,7 @@ impl Drop for PipeWireBackend {
 
 impl AudioBackend for PipeWireBackend {
     fn refresh(&self) -> AudioSnapshot {
-        self.snapshot
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_default()
+        self.snapshot.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
     fn set_mute(&self, node_id: u32, muted: bool) {
@@ -114,6 +108,18 @@ impl AudioBackend for PipeWireBackend {
         let _ = self
             .commands
             .send(BackendCommand::SetVolume { node_id, scalar });
+    }
+
+    fn set_default_sink(&self, node_name: &str) {
+        let _ = self.commands.send(BackendCommand::SetDefaultSink {
+            node_name: node_name.to_string(),
+        });
+    }
+
+    fn set_default_source(&self, node_name: &str) {
+        let _ = self.commands.send(BackendCommand::SetDefaultSource {
+            node_name: node_name.to_string(),
+        });
     }
 }
 
@@ -134,8 +140,7 @@ fn run_backend_loop(
     // the command receiver to issue `set_param` calls for mute /
     // volume; the listener funnels Props parameter changes back into
     // the snapshot so the UI reflects real PipeWire state.
-    let proxies: Rc<RefCell<HashMap<u32, NodeEntry>>> =
-        Rc::new(RefCell::new(HashMap::new()));
+    let proxies: Rc<RefCell<HashMap<u32, NodeEntry>>> = Rc::new(RefCell::new(HashMap::new()));
 
     // Per-node channel count, learned from `channelVolumes` arrays in
     // the Props events. Required when writing volume so we can send a
@@ -146,12 +151,19 @@ fn run_backend_loop(
     // exists, producing surprising audible behavior.
     let channels: Rc<RefCell<HashMap<u32, usize>>> = Rc::new(RefCell::new(HashMap::new()));
 
+    // Holds the bound `default` metadata proxy + its listener. Used to
+    // both write `default.audio.sink`/`default.audio.source` (Set
+    // Default action) and to receive change notifications so the
+    // snapshot tracks whatever the system considers default.
+    let default_metadata: Rc<RefCell<Option<DefaultMetaEntry>>> = Rc::new(RefCell::new(None));
+
     let snapshot_for_global = snapshot.clone();
     let snapshot_for_remove = snapshot.clone();
     let proxies_for_global = proxies.clone();
     let proxies_for_remove = proxies.clone();
     let channels_for_global = channels.clone();
     let channels_for_remove = channels.clone();
+    let default_for_global = default_metadata.clone();
     let registry_for_bind = registry.clone();
 
     let _registry_listener = registry
@@ -165,6 +177,62 @@ fn run_backend_loop(
                 } else if let Some(card) = audio_card_from_global(global) {
                     if !snap.cards.iter().any(|existing| existing.id == card.id) {
                         snap.cards.push(card);
+                    }
+                }
+            }
+
+            if global.type_ == pw::types::ObjectType::Metadata
+                && default_for_global.borrow().is_none()
+            {
+                let is_default_meta = global
+                    .props
+                    .as_ref()
+                    .and_then(|props| prop(props.as_ref(), "metadata.name"))
+                    .map(|name| name == "default")
+                    .unwrap_or(false);
+                if is_default_meta {
+                    match registry_for_bind.bind::<pw::metadata::Metadata, _>(global) {
+                        Ok(meta) => {
+                            let snapshot_for_meta = snapshot_for_global.clone();
+                            let listener = meta
+                                .add_listener_local()
+                                .property(move |_subject, key, _type_, value| {
+                                    let Some(key) = key else {
+                                        // null key = all properties
+                                        // cleared. Drop both defaults.
+                                        if let Ok(mut snap) = snapshot_for_meta.lock() {
+                                            snap.default_sink_name = None;
+                                            snap.default_source_name = None;
+                                        }
+                                        return 0;
+                                    };
+                                    let target = match key {
+                                        "default.audio.sink" => Some(true),
+                                        "default.audio.source" => Some(false),
+                                        _ => None,
+                                    };
+                                    let Some(is_sink) = target else {
+                                        return 0;
+                                    };
+                                    let name = value.and_then(default_name_from_json);
+                                    if let Ok(mut snap) = snapshot_for_meta.lock() {
+                                        if is_sink {
+                                            snap.default_sink_name = name;
+                                        } else {
+                                            snap.default_source_name = name;
+                                        }
+                                    }
+                                    0
+                                })
+                                .register();
+                            *default_for_global.borrow_mut() = Some(DefaultMetaEntry {
+                                proxy: meta,
+                                _listener: listener,
+                            });
+                        }
+                        Err(err) => {
+                            eprintln!("aetna-volume: failed to bind default metadata: {err}")
+                        }
                     }
                 }
             }
@@ -202,9 +270,7 @@ fn run_backend_loop(
                             return;
                         }
                         if let Ok(mut snap) = snapshot_for_props.lock() {
-                            if let Some(node) =
-                                snap.nodes.iter_mut().find(|n| n.id == node_id)
-                            {
+                            if let Some(node) = snap.nodes.iter_mut().find(|n| n.id == node_id) {
                                 let current = node.volume.clone().unwrap_or(Volume {
                                     scalar: 1.0,
                                     muted: false,
@@ -239,6 +305,7 @@ fn run_backend_loop(
 
     let proxies_for_commands = proxies.clone();
     let channels_for_commands = channels.clone();
+    let default_for_commands = default_metadata.clone();
     let mainloop_for_quit = mainloop.clone();
     let _commands_attached = commands_rx.attach(mainloop.loop_(), move |cmd| match cmd {
         BackendCommand::Quit => mainloop_for_quit.quit(),
@@ -248,6 +315,20 @@ fn run_backend_loop(
         BackendCommand::SetVolume { node_id, scalar } => {
             let count = channels_for_commands.borrow().get(&node_id).copied();
             apply_volume(&proxies_for_commands.borrow(), node_id, scalar, count);
+        }
+        BackendCommand::SetDefaultSink { node_name } => {
+            apply_default(
+                &default_for_commands.borrow(),
+                "default.audio.sink",
+                &node_name,
+            );
+        }
+        BackendCommand::SetDefaultSource { node_name } => {
+            apply_default(
+                &default_for_commands.borrow(),
+                "default.audio.source",
+                &node_name,
+            );
         }
     });
 
@@ -271,6 +352,45 @@ fn run_backend_loop(
 struct NodeEntry {
     proxy: pw::node::Node,
     _listener: pw::node::NodeListener,
+}
+
+struct DefaultMetaEntry {
+    proxy: pw::metadata::Metadata,
+    _listener: pw::metadata::MetadataListener,
+}
+
+fn apply_default(entry: &Option<DefaultMetaEntry>, key: &str, node_name: &str) {
+    let Some(entry) = entry else {
+        eprintln!("aetna-volume: cannot set {key}={node_name} — default metadata not yet bound");
+        return;
+    };
+    // PipeWire metadata stores defaults as JSON like `{"name": "..."}`.
+    // The `subject` is `PW_ID_CORE` (= 0) for the global defaults.
+    let value = format!("{{\"name\":\"{}\"}}", json_escape(node_name));
+    entry
+        .proxy
+        .set_property(0, key, Some("Spa:String:JSON"), Some(&value));
+}
+
+/// Escape a string for inclusion in a JSON string literal. Only the
+/// backslash and double-quote escapes are required for PipeWire node
+/// names (which never contain control characters in practice).
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Pull the `name` field out of `{"name":"..."}` style JSON that
+/// PipeWire stores in the `default` metadata.
+fn default_name_from_json(value: &str) -> Option<String> {
+    let key = "\"name\"";
+    let key_pos = value.find(key)?;
+    let after_key = &value[key_pos + key.len()..];
+    let colon_pos = after_key.find(':')?;
+    let after_colon = &after_key[colon_pos + 1..];
+    let open_quote = after_colon.find('"')?;
+    let rest = &after_colon[open_quote + 1..];
+    let close_quote = rest.find('"')?;
+    Some(rest[..close_quote].to_string())
 }
 
 fn apply_mute(proxies: &HashMap<u32, NodeEntry>, node_id: u32, muted: bool) {
@@ -347,8 +467,7 @@ fn decode_props(bytes: &[u8]) -> DecodedProps {
         scalar: None,
         channel_count: None,
     };
-    let Ok((_, value)) =
-        pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(bytes)
+    let Ok((_, value)) = pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(bytes)
     else {
         return decoded;
     };
@@ -467,7 +586,6 @@ where
             .or_else(|| prop(props, "node.target"))
             .map(str::to_string),
         volume: None,
-        is_default: false,
     })
 }
 

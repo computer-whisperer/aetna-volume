@@ -83,7 +83,6 @@ pub struct AudioNode {
     pub media_name: Option<String>,
     pub target: Option<String>,
     pub volume: Option<Volume>,
-    pub is_default: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,12 +100,34 @@ pub struct AudioSnapshot {
     pub cards: Vec<AudioCard>,
     pub server_name: Option<String>,
     pub error: Option<String>,
+    /// `node.name` of the current default audio sink, as published by
+    /// the PipeWire `default` metadata. Compared against
+    /// `AudioNode.name` to derive per-row default badges.
+    pub default_sink_name: Option<String>,
+    /// `node.name` of the current default audio source.
+    pub default_source_name: Option<String>,
+}
+
+impl AudioSnapshot {
+    pub fn is_default(&self, node: &AudioNode) -> bool {
+        match node.class {
+            AudioClass::Device {
+                direction: Direction::Output,
+            } => self.default_sink_name.as_deref() == Some(node.name.as_str()),
+            AudioClass::Device {
+                direction: Direction::Input,
+            } => self.default_source_name.as_deref() == Some(node.name.as_str()),
+            _ => false,
+        }
+    }
 }
 
 impl AudioSnapshot {
     pub fn demo() -> Self {
         Self {
             server_name: Some("PipeWire".into()),
+            default_sink_name: Some("alsa_output.pci-0000_0b_00.4.analog-stereo".into()),
+            default_source_name: Some("alsa_input.usb-mic.mono-fallback".into()),
             nodes: vec![
                 AudioNode {
                     id: 42,
@@ -122,7 +143,6 @@ impl AudioSnapshot {
                         scalar: 0.64,
                         muted: false,
                     }),
-                    is_default: true,
                 },
                 AudioNode {
                     id: 56,
@@ -138,7 +158,6 @@ impl AudioSnapshot {
                         scalar: 0.82,
                         muted: false,
                     }),
-                    is_default: false,
                 },
                 AudioNode {
                     id: 61,
@@ -154,7 +173,6 @@ impl AudioSnapshot {
                         scalar: 0.48,
                         muted: true,
                     }),
-                    is_default: false,
                 },
                 AudioNode {
                     id: 77,
@@ -170,7 +188,6 @@ impl AudioSnapshot {
                         scalar: 0.71,
                         muted: false,
                     }),
-                    is_default: true,
                 },
             ],
             cards: vec![AudioCard {

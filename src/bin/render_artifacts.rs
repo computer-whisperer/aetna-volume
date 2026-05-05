@@ -1,0 +1,68 @@
+//! Render every tab of `aetna-volume` against the demo backend and dump
+//! Aetna bundle artifacts (svg + tree + draw ops + lint) to `out/`.
+//!
+//! Run:
+//!   cargo run --bin render_artifacts
+//!   cargo run --bin render_artifacts -- configuration
+//!
+//! With no args, every tab is rendered. With one or more tab names
+//! (case-insensitive: playback, recording, outputs, inputs, configuration),
+//! only those tabs are rendered.
+
+use std::path::PathBuf;
+
+use aetna_core::{App, Rect, render_bundle, write_bundle};
+use aetna_volume::{app::VolumeApp, backend::DemoBackend, model::Tab};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let viewport = Rect::new(0.0, 0.0, 980.0, 680.0);
+    let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("out");
+
+    let requested: Vec<Tab> = std::env::args()
+        .skip(1)
+        .map(|raw| parse_tab(&raw).unwrap_or_else(|| panic!("unknown tab `{raw}`")))
+        .collect();
+    let tabs: Vec<Tab> = if requested.is_empty() {
+        Tab::ALL.to_vec()
+    } else {
+        requested
+    };
+
+    for tab in tabs {
+        let app = VolumeApp::new(Box::new(DemoBackend)).with_active_tab(tab);
+        let mut tree = app.build();
+        let bundle = render_bundle(&mut tree, viewport, Some("aetna-volume/src"));
+        let basename = artifact_basename(tab);
+        let written = write_bundle(&bundle, &out_dir, &basename)?;
+        for path in &written {
+            println!("wrote {}", path.display());
+        }
+
+        if !bundle.lint.findings.is_empty() {
+            eprintln!(
+                "\n{basename} lint findings ({}):",
+                bundle.lint.findings.len()
+            );
+            eprint!("{}", bundle.lint.text());
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_tab(raw: &str) -> Option<Tab> {
+    Tab::ALL.into_iter().find(|tab| {
+        tab.label().eq_ignore_ascii_case(raw) || artifact_basename(*tab) == raw.to_lowercase()
+    })
+}
+
+fn artifact_basename(tab: Tab) -> String {
+    let name = match tab {
+        Tab::Playback => "playback",
+        Tab::Recording => "recording",
+        Tab::Outputs => "outputs",
+        Tab::Inputs => "inputs",
+        Tab::Configuration => "configuration",
+    };
+    format!("tab_{name}")
+}
