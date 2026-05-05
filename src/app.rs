@@ -115,6 +115,33 @@ impl VolumeApp {
         self.backend.set_volume(id, pct as f32 / 100.0);
     }
 
+    /// Step the volume on a focused-slider key event. Arrow keys move
+    /// by 1pct; PageUp/PageDown by 10pct (the volume range maxes out
+    /// at 150, so 1/150 ≈ 0.67% per arrow press in normalized space).
+    fn adjust_volume_from_key(&self, event: &UiEvent, key: &str, id: u32) {
+        let current_pct = {
+            let snapshot = self.snapshot.borrow();
+            let Some(node) = snapshot.nodes.iter().find(|n| n.id == id) else {
+                return;
+            };
+            self.percent_for(node)
+        };
+        let mut normalized = current_pct as f32 / 150.0;
+        if aetna_core::widgets::slider::apply_event(
+            &mut normalized,
+            event,
+            key,
+            1.0 / 150.0,
+            10.0 / 150.0,
+        ) {
+            let new_pct = (normalized * 150.0).round() as u32;
+            if new_pct != current_pct {
+                self.volume_overrides.borrow_mut().insert(id, new_pct);
+                self.backend.set_volume(id, new_pct as f32 / 100.0);
+            }
+        }
+    }
+
     fn set_default(&self, id: u32) {
         let snapshot = self.snapshot.borrow();
         let Some(node) = snapshot.nodes.iter().find(|n| n.id == id) else {
@@ -255,6 +282,11 @@ impl App for VolumeApp {
             UiEventKind::PointerDown | UiEventKind::Drag => {
                 if let Some(id) = node_id_from_key(key, "volume:") {
                     self.scrub_from_event(&event, id);
+                }
+            }
+            UiEventKind::KeyDown => {
+                if let Some(id) = node_id_from_key(key, "volume:") {
+                    self.adjust_volume_from_key(&event, key, id);
                 }
             }
             _ => {}
