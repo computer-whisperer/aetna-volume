@@ -85,13 +85,33 @@ pub struct AudioNode {
     pub volume: Option<Volume>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProfileAvailability {
+    Unknown,
+    No,
+    Yes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioProfile {
+    /// PipeWire's `index` for the profile — the canonical identifier
+    /// passed back to `Device::set_param` to switch profiles.
+    pub index: u32,
+    pub name: String,
+    pub description: String,
+    pub available: ProfileAvailability,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioCard {
     pub id: u32,
     pub name: String,
     pub description: String,
-    pub active_profile: Option<String>,
-    pub profiles: Vec<String>,
+    /// Index of the currently active profile (matches one of
+    /// `profiles[i].index`), or `None` if the device hasn't reported
+    /// a Profile param yet.
+    pub active_profile: Option<u32>,
+    pub profiles: Vec<AudioProfile>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -194,11 +214,26 @@ impl AudioSnapshot {
                 id: 12,
                 name: "alsa_card.pci-0000_0b_00.4".into(),
                 description: "Built-in Audio".into(),
-                active_profile: Some("Analog Stereo Duplex".into()),
+                active_profile: Some(1),
                 profiles: vec![
-                    "Analog Stereo Duplex".into(),
-                    "Analog Stereo Output".into(),
-                    "Off".into(),
+                    AudioProfile {
+                        index: 1,
+                        name: "output:analog-stereo+input:analog-stereo".into(),
+                        description: "Analog Stereo Duplex".into(),
+                        available: ProfileAvailability::Yes,
+                    },
+                    AudioProfile {
+                        index: 2,
+                        name: "output:analog-stereo".into(),
+                        description: "Analog Stereo Output".into(),
+                        available: ProfileAvailability::Yes,
+                    },
+                    AudioProfile {
+                        index: 0,
+                        name: "off".into(),
+                        description: "Off".into(),
+                        available: ProfileAvailability::Yes,
+                    },
                 ],
             }],
             error: None,

@@ -5,7 +5,10 @@ use aetna_core::*;
 
 use crate::backend::AudioBackend;
 use crate::levels::{LevelService, NodeLevels};
-use crate::model::{AudioCard, AudioClass, AudioNode, AudioSnapshot, Direction, Tab, Volume};
+use crate::model::{
+    AudioCard, AudioClass, AudioNode, AudioProfile, AudioSnapshot, Direction, ProfileAvailability,
+    Tab, Volume,
+};
 
 pub const MAX_VOLUME_PERCENT: u32 = 150;
 pub const SLIDER_THUMB_SIZE: f32 = 14.0;
@@ -170,6 +173,8 @@ impl App for VolumeApp {
                     self.toggle_mute(id);
                 } else if let Some(id) = node_id_from_key(key, "default:") {
                     self.set_default(id);
+                } else if let Some((card_id, profile_index)) = profile_key(key) {
+                    self.backend.set_card_profile(card_id, profile_index);
                 } else if let Some(id) = node_id_from_key(key, "volume:") {
                     self.scrub_from_event(&event, id);
                 }
@@ -349,40 +354,65 @@ fn node_row(
 }
 
 fn card_row(card: &AudioCard) -> El {
-    column([
-        row([
-            icon("settings").icon_size(20.0).width(Size::Fixed(32.0)),
-            column([
-                text(&card.description).label(),
-                text(format!("#{id}  {name}", id = card.id, name = card.name))
-                    .caption()
-                    .muted()
-                    .ellipsis(),
-            ])
-            .gap(tokens::SPACE_XS)
-            .width(Size::Fill(1.0)),
-            button(
-                card.active_profile
-                    .as_deref()
-                    .unwrap_or("No active profile"),
-            )
-            .secondary(),
+    let active_label = card
+        .active_profile
+        .and_then(|idx| card.profiles.iter().find(|p| p.index == idx))
+        .map(|p| p.description.as_str())
+        .unwrap_or("No active profile");
+
+    let header = row([
+        icon("settings").icon_size(20.0).width(Size::Fixed(32.0)),
+        column([
+            text(&card.description).label(),
+            text(format!("#{id}  {name}", id = card.id, name = card.name))
+                .caption()
+                .muted()
+                .ellipsis(),
         ])
-        .gap(tokens::SPACE_MD)
-        .align(Align::Center),
-        row(card
-            .profiles
+        .gap(tokens::SPACE_XS)
+        .width(Size::Fill(1.0)),
+        text(active_label).caption().muted(),
+    ])
+    .gap(tokens::SPACE_MD)
+    .align(Align::Center);
+
+    let profile_rows: Vec<El> = if card.profiles.is_empty() {
+        vec![text("No profiles enumerated yet.").caption().muted()]
+    } else {
+        card.profiles
             .iter()
-            .map(|profile| badge(profile.as_str()))
-            .collect::<Vec<_>>())
-        .gap(tokens::SPACE_SM),
+            .map(|profile| profile_row(card.id, profile, card.active_profile))
+            .collect()
+    };
+
+    column([
+        header,
+        column(profile_rows).gap(tokens::SPACE_XS).height(Size::Hug),
     ])
     .gap(tokens::SPACE_MD)
     .padding(tokens::SPACE_MD)
     .width(Size::Fill(1.0))
+    .height(Size::Hug)
     .fill(tokens::BG_CARD)
     .stroke(tokens::BORDER)
     .radius(tokens::RADIUS_MD)
+}
+
+fn profile_row(card_id: u32, profile: &AudioProfile, active: Option<u32>) -> El {
+    let is_active = active == Some(profile.index);
+    let unavailable = profile.available == ProfileAvailability::No;
+    let mut btn = button(profile.description.as_str())
+        .key(format!("profile:{card_id}:{idx}", idx = profile.index))
+        .width(Size::Fill(1.0))
+        .justify(Justify::Start);
+    btn = if is_active {
+        btn.primary()
+    } else if unavailable {
+        btn.ghost()
+    } else {
+        btn.secondary()
+    };
+    btn
 }
 
 fn volume_slider(id: u32, percent: u32, muted: bool) -> El {
@@ -513,6 +543,12 @@ fn level_to_meter(value: f32) -> f32 {
 
 fn node_id_from_key(key: &str, prefix: &str) -> Option<u32> {
     key.strip_prefix(prefix)?.parse().ok()
+}
+
+fn profile_key(key: &str) -> Option<(u32, u32)> {
+    let rest = key.strip_prefix("profile:")?;
+    let (card, index) = rest.split_once(':')?;
+    Some((card.parse().ok()?, index.parse().ok()?))
 }
 
 pub fn slider_percent_from_x(rect: Rect, x: f32) -> u32 {

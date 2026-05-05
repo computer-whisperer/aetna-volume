@@ -12,7 +12,10 @@ use std::{
 };
 
 use crate::backend::AudioBackend;
-use crate::model::{AudioCard, AudioClass, AudioNode, AudioSnapshot, Direction, Volume};
+use crate::model::{
+    AudioCard, AudioClass, AudioNode, AudioProfile, AudioSnapshot, Direction, ProfileAvailability,
+    Volume,
+};
 
 /// Commands sent from the main thread to the PipeWire backend thread
 /// over [`pw::channel`] (loop-integrated, fires the receiver callback
@@ -22,6 +25,7 @@ enum BackendCommand {
     SetVolume { node_id: u32, scalar: f32 },
     SetDefaultSink { node_name: String },
     SetDefaultSource { node_name: String },
+    SetCardProfile { card_id: u32, profile_index: u32 },
     Quit,
 }
 
@@ -121,6 +125,13 @@ impl AudioBackend for PipeWireBackend {
             node_name: node_name.to_string(),
         });
     }
+
+    fn set_card_profile(&self, card_id: u32, profile_index: u32) {
+        let _ = self.commands.send(BackendCommand::SetCardProfile {
+            card_id,
+            profile_index,
+        });
+    }
 }
 
 fn run_backend_loop(
@@ -157,6 +168,11 @@ fn run_backend_loop(
     // snapshot tracks whatever the system considers default.
     let default_metadata: Rc<RefCell<Option<DefaultMetaEntry>>> = Rc::new(RefCell::new(None));
 
+    // Per-card Device proxies + their param listeners. Used to read
+    // active profile + enumerate available profiles, and to call
+    // `set_param(ParamType::Profile, ...)` when the user picks one.
+    let devices: Rc<RefCell<HashMap<u32, DeviceEntry>>> = Rc::new(RefCell::new(HashMap::new()));
+
     let snapshot_for_global = snapshot.clone();
     let snapshot_for_remove = snapshot.clone();
     let proxies_for_global = proxies.clone();
@@ -164,21 +180,93 @@ fn run_backend_loop(
     let channels_for_global = channels.clone();
     let channels_for_remove = channels.clone();
     let default_for_global = default_metadata.clone();
+    let devices_for_global = devices.clone();
+    let devices_for_remove = devices.clone();
     let registry_for_bind = registry.clone();
 
     let _registry_listener = registry
         .add_listener_local()
         .global(move |global| {
-            if let Ok(mut snap) = snapshot_for_global.lock() {
+            let is_card = if let Ok(mut snap) = snapshot_for_global.lock() {
                 if let Some(node) = audio_node_from_global(global) {
                     if !snap.nodes.iter().any(|existing| existing.id == node.id) {
                         snap.nodes.push(node);
                     }
+                    false
                 } else if let Some(card) = audio_card_from_global(global) {
                     if !snap.cards.iter().any(|existing| existing.id == card.id) {
                         snap.cards.push(card);
                     }
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+
+            if is_card {
+                let card_id = global.id;
+                let device = match registry_for_bind.bind::<pw::device::Device, _>(global) {
+                    Ok(device) => device,
+                    Err(err) => {
+                        eprintln!("aetna-volume: failed to bind device {card_id}: {err}");
+                        return;
+                    }
+                };
+                let snapshot_for_param = snapshot_for_global.clone();
+                let listener = device
+                    .add_listener_local()
+                    .param(move |_seq, id, _index, _next, param| {
+                        let Some(param) = param else {
+                            return;
+                        };
+                        let bytes = param.as_bytes();
+                        if id == ParamType::Profile {
+                            if let Some(active) = decode_active_profile_index(bytes) {
+                                if let Ok(mut snap) = snapshot_for_param.lock() {
+                                    if let Some(card) =
+                                        snap.cards.iter_mut().find(|c| c.id == card_id)
+                                    {
+                                        card.active_profile = Some(active);
+                                    }
+                                }
+                            }
+                        } else if id == ParamType::EnumProfile {
+                            if let Some(profile) = decode_enum_profile(bytes) {
+                                if let Ok(mut snap) = snapshot_for_param.lock() {
+                                    if let Some(card) =
+                                        snap.cards.iter_mut().find(|c| c.id == card_id)
+                                    {
+                                        if let Some(slot) = card
+                                            .profiles
+                                            .iter_mut()
+                                            .find(|p| p.index == profile.index)
+                                        {
+                                            *slot = profile;
+                                        } else {
+                                            card.profiles.push(profile);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    })
+                    .register();
+                device.subscribe_params(&[ParamType::Profile, ParamType::EnumProfile]);
+                // Trigger an initial enumeration of available profiles.
+                // Subscribe alone doesn't fire until the value changes;
+                // enum_params asks PipeWire to emit the current set
+                // immediately.
+                device.enum_params(0, Some(ParamType::EnumProfile), 0, u32::MAX);
+                device.enum_params(0, Some(ParamType::Profile), 0, u32::MAX);
+                devices_for_global.borrow_mut().insert(
+                    card_id,
+                    DeviceEntry {
+                        proxy: device,
+                        _listener: listener,
+                    },
+                );
             }
 
             if global.type_ == pw::types::ObjectType::Metadata
@@ -300,12 +388,14 @@ fn run_backend_loop(
             }
             proxies_for_remove.borrow_mut().remove(&id);
             channels_for_remove.borrow_mut().remove(&id);
+            devices_for_remove.borrow_mut().remove(&id);
         })
         .register();
 
     let proxies_for_commands = proxies.clone();
     let channels_for_commands = channels.clone();
     let default_for_commands = default_metadata.clone();
+    let devices_for_commands = devices.clone();
     let mainloop_for_quit = mainloop.clone();
     let _commands_attached = commands_rx.attach(mainloop.loop_(), move |cmd| match cmd {
         BackendCommand::Quit => mainloop_for_quit.quit(),
@@ -329,6 +419,12 @@ fn run_backend_loop(
                 "default.audio.source",
                 &node_name,
             );
+        }
+        BackendCommand::SetCardProfile {
+            card_id,
+            profile_index,
+        } => {
+            apply_card_profile(&devices_for_commands.borrow(), card_id, profile_index);
         }
     });
 
@@ -357,6 +453,122 @@ struct NodeEntry {
 struct DefaultMetaEntry {
     proxy: pw::metadata::Metadata,
     _listener: pw::metadata::MetadataListener,
+}
+
+struct DeviceEntry {
+    proxy: pw::device::Device,
+    _listener: pw::device::DeviceListener,
+}
+
+fn apply_card_profile(devices: &HashMap<u32, DeviceEntry>, card_id: u32, profile_index: u32) {
+    let Some(entry) = devices.get(&card_id) else {
+        eprintln!("aetna-volume: cannot set profile on card {card_id} — device not bound");
+        return;
+    };
+    let pod = match build_profile_pod(profile_index) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("aetna-volume: failed to build profile pod for card {card_id}: {err}");
+            return;
+        }
+    };
+    let Some(pod) = pw::spa::pod::Pod::from_bytes(&pod) else {
+        eprintln!("aetna-volume: built invalid profile pod for card {card_id}");
+        return;
+    };
+    entry.proxy.set_param(ParamType::Profile, 0, pod);
+}
+
+fn build_profile_pod(profile_index: u32) -> Result<Vec<u8>> {
+    let obj = Object {
+        type_: SpaTypes::ObjectParamProfile.as_raw(),
+        id: ParamType::Profile.as_raw(),
+        properties: vec![
+            Property::new(
+                pw::spa::sys::SPA_PARAM_PROFILE_index,
+                Value::Int(profile_index as i32),
+            ),
+            // Persist across PipeWire restarts. Matches what
+            // pavucontrol writes when you pick a profile.
+            Property::new(pw::spa::sys::SPA_PARAM_PROFILE_save, Value::Bool(true)),
+        ],
+    };
+    let mut out = Vec::new();
+    pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(&mut out),
+        &Value::Object(obj),
+    )?;
+    Ok(out)
+}
+
+fn decode_active_profile_index(bytes: &[u8]) -> Option<u32> {
+    let (_, value) =
+        pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(bytes).ok()?;
+    let Value::Object(obj) = value else {
+        return None;
+    };
+    for prop in &obj.properties {
+        if prop.key == pw::spa::sys::SPA_PARAM_PROFILE_index {
+            if let Value::Int(i) = prop.value {
+                return Some(i as u32);
+            }
+        }
+    }
+    None
+}
+
+fn decode_enum_profile(bytes: &[u8]) -> Option<AudioProfile> {
+    let (_, value) =
+        pw::spa::pod::deserialize::PodDeserializer::deserialize_any_from(bytes).ok()?;
+    let Value::Object(obj) = value else {
+        return None;
+    };
+    let mut index: Option<u32> = None;
+    let mut name: Option<String> = None;
+    let mut description: Option<String> = None;
+    let mut available = ProfileAvailability::Unknown;
+    for prop in &obj.properties {
+        match prop.key {
+            k if k == pw::spa::sys::SPA_PARAM_PROFILE_index => {
+                if let Value::Int(i) = prop.value {
+                    index = Some(i as u32);
+                }
+            }
+            k if k == pw::spa::sys::SPA_PARAM_PROFILE_name => {
+                if let Value::String(s) = &prop.value {
+                    name = Some(s.clone());
+                }
+            }
+            k if k == pw::spa::sys::SPA_PARAM_PROFILE_description => {
+                if let Value::String(s) = &prop.value {
+                    description = Some(s.clone());
+                }
+            }
+            k if k == pw::spa::sys::SPA_PARAM_PROFILE_available => {
+                if let Value::Id(id) = prop.value {
+                    available = match id.0 {
+                        x if x == pw::spa::sys::SPA_PARAM_AVAILABILITY_yes => {
+                            ProfileAvailability::Yes
+                        }
+                        x if x == pw::spa::sys::SPA_PARAM_AVAILABILITY_no => {
+                            ProfileAvailability::No
+                        }
+                        _ => ProfileAvailability::Unknown,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    let index = index?;
+    let name = name.unwrap_or_else(|| format!("profile-{index}"));
+    let description = description.clone().unwrap_or_else(|| name.clone());
+    Some(AudioProfile {
+        index,
+        name,
+        description,
+        available,
+    })
 }
 
 fn apply_default(entry: &Option<DefaultMetaEntry>, key: &str, node_name: &str) {

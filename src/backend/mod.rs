@@ -36,6 +36,14 @@ pub trait AudioBackend {
     fn set_default_source(&self, node_name: &str) {
         let _ = node_name;
     }
+
+    /// Switch a card to one of its enumerated profiles. `card_id` is
+    /// the PipeWire global id of the `Audio/Device`; `profile_index`
+    /// is the `index` field of an [`crate::model::AudioProfile`] from
+    /// the same card.
+    fn set_card_profile(&self, card_id: u32, profile_index: u32) {
+        let _ = (card_id, profile_index);
+    }
 }
 
 #[derive(Default)]
