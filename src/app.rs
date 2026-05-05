@@ -236,8 +236,7 @@ impl App for VolumeApp {
         // for whichever card is currently open is a sibling of the main
         // column. Only the configuration tab can open one, and only one
         // can be open at a time.
-        let mut layers: Vec<El> = vec![main];
-        if self.active_tab == Tab::Configuration
+        let profile_menu = if self.active_tab == Tab::Configuration
             && let Some(card_id) = *self.profile_dropdown_open.borrow()
             && let Some(card) = snapshot.cards.iter().find(|c| c.id == card_id)
         {
@@ -253,9 +252,11 @@ impl App for VolumeApp {
                     (p.index.to_string(), label)
                 })
                 .collect();
-            layers.push(select_menu(format!("profile:{card_id}"), options));
-        }
-        stack(layers).fill_size()
+            Some(select_menu(format!("profile:{card_id}"), options))
+        } else {
+            None
+        };
+        overlays(main, [profile_menu]).fill_size()
     }
 
     fn on_event(&mut self, event: UiEvent) {
