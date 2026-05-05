@@ -76,6 +76,7 @@ impl VolumeApp {
         };
         let pct = slider_percent_from_x(target.rect, x);
         self.volume_overrides.borrow_mut().insert(id, pct);
+        self.backend.set_volume(id, pct as f32 / 100.0);
     }
 
     fn toggle_mute(&self, id: u32) {
@@ -94,7 +95,9 @@ impl VolumeApp {
                     .map(|v| v.muted)
                     .unwrap_or(false)
             });
-        self.mute_overrides.borrow_mut().insert(id, !current);
+        let new_muted = !current;
+        self.mute_overrides.borrow_mut().insert(id, new_muted);
+        self.backend.set_mute(id, new_muted);
     }
 }
 
