@@ -489,6 +489,11 @@ fn activity_meter(levels: Option<&NodeLevels>, muted: bool) -> El {
     )
     .gap(4.0)
     .width(Size::Fill(1.0))
+    // Hug height so the row's `align(Center)` vertically centers the
+    // 2-channel stack with the icon/slider/mute siblings. Default Fill
+    // would claim the full 64 px content area and top-align the rows
+    // inside, leaving the meter visibly higher than its neighbors.
+    .height(Size::Hug)
 }
 
 fn meter_channel(label: &'static str, peak: f32, rms: f32, muted: bool) -> El {
