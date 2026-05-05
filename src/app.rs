@@ -232,10 +232,7 @@ fn sidebar(active: Tab) -> El {
         Tab::ALL
             .into_iter()
             .map(|tab| {
-                let mut item = button(tab.label())
-                    .key(tab.key())
-                    .width(Size::Fill(1.0))
-                    .justify(Justify::Start);
+                let mut item = button(tab.label()).key(tab.key()).width(Size::Fill(1.0));
                 if tab == active {
                     item = item.primary();
                 } else {
@@ -274,13 +271,20 @@ fn node_panel(nodes: Vec<&AudioNode>, tab: Tab, app: &VolumeApp) -> El {
     };
 
     column([
-        panel_title(
-            tab.label(),
-            "Live PipeWire objects will populate this surface.",
-        ),
+        panel_title(tab.label(), tab_subtitle(tab)),
         scroll(rows).key("node-list").height(Size::Fill(1.0)),
     ])
     .gap(tokens::SPACE_MD)
+}
+
+fn tab_subtitle(tab: Tab) -> &'static str {
+    match tab {
+        Tab::Playback => "Apps sending audio to a sink.",
+        Tab::Recording => "Apps capturing audio from a source.",
+        Tab::Outputs => "Audio sinks — speakers, headphones, virtual outputs.",
+        Tab::Inputs => "Audio sources — microphones, line-in, virtual inputs.",
+        Tab::Configuration => "Cards, profiles, and ports.",
+    }
 }
 
 fn configuration_panel(cards: &[AudioCard], app: &VolumeApp) -> El {
@@ -294,7 +298,7 @@ fn configuration_panel(cards: &[AudioCard], app: &VolumeApp) -> El {
     };
 
     column([
-        panel_title("Configuration", "Cards, profiles, and ports."),
+        panel_title(Tab::Configuration.label(), tab_subtitle(Tab::Configuration)),
         scroll(rows).key("cards").height(Size::Fill(1.0)),
     ])
     .gap(tokens::SPACE_MD)
@@ -354,7 +358,10 @@ fn node_row(
                 .ellipsis(),
         ])
         .gap(tokens::SPACE_XS)
-        .width(Size::Fill(1.0)),
+        .width(Size::Fill(1.0))
+        // Hug so the row's `align(Center)` centers the title+caption
+        // pair vertically along with the icon/meter/slider siblings.
+        .height(Size::Hug),
         activity_meter(levels.as_ref(), muted).width(Size::Fixed(98.0)),
         volume_slider(node.id, volume, muted).width(Size::Fixed(180.0)),
         text(format!("{volume}%"))
@@ -425,8 +432,7 @@ fn profile_row(card_id: u32, profile: &AudioProfile, active: Option<u32>) -> El 
     let unavailable = profile.available == ProfileAvailability::No;
     let mut btn = button(profile.description.as_str())
         .key(format!("profile:{card_id}:{idx}", idx = profile.index))
-        .width(Size::Fill(1.0))
-        .justify(Justify::Start);
+        .width(Size::Fill(1.0));
     btn = if is_active {
         btn.primary()
     } else if unavailable {
@@ -474,6 +480,9 @@ fn activity_meter(levels: Option<&NodeLevels>, muted: bool) -> El {
 }
 
 fn meter_channel(label: &'static str, peak: f32, rms: f32, muted: bool) -> El {
+    // Row hugs the caption-height label so the L/R glyph isn't clipped
+    // by an undersized track row. The 6 px meter bar centers inside
+    // automatically (Align::Center on the row).
     row([
         text(label)
             .caption()
@@ -485,7 +494,7 @@ fn meter_channel(label: &'static str, peak: f32, rms: f32, muted: bool) -> El {
     .gap(5.0)
     .align(Align::Center)
     .width(Size::Fill(1.0))
-    .height(Size::Fixed(8.0))
+    .height(Size::Hug)
 }
 
 fn meter_bar(peak: f32, rms: f32, muted: bool) -> El {
@@ -574,13 +583,17 @@ fn empty_state(tab: Tab) -> El {
     .radius(tokens::RADIUS_MD)
 }
 
+fn plural(n: usize, singular: &str, plural: &str) -> String {
+    format!("{n} {}", if n == 1 { singular } else { plural })
+}
+
 fn status_bar(snapshot: &AudioSnapshot, meter_count: usize) -> El {
     row([
         text(format!(
-            "{} nodes, {} cards, {} meters",
-            snapshot.nodes.len(),
-            snapshot.cards.len(),
-            meter_count
+            "{} · {} · {}",
+            plural(snapshot.nodes.len(), "node", "nodes"),
+            plural(snapshot.cards.len(), "card", "cards"),
+            plural(meter_count, "meter", "meters"),
         ))
         .caption()
         .muted()

@@ -15,7 +15,8 @@ use aetna_core::{App, Rect, render_bundle, write_bundle};
 use aetna_volume::{app::VolumeApp, backend::DemoBackend, model::Tab};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let viewport = Rect::new(0.0, 0.0, 980.0, 680.0);
+    // Mirror the runtime viewport (50% of a 1080p panel).
+    let viewport = Rect::new(0.0, 0.0, 960.0, 1080.0);
     let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("out");
 
     let requested: Vec<Tab> = std::env::args()
