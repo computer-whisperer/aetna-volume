@@ -52,13 +52,10 @@ name = "aetna-volume"
 version = "0.1.0"
 dependencies = [
  "aetna-core",
- "aetna-wgpu",
+ "aetna-winit-wgpu",
  "anyhow",
  "pipewire",
- "pollster",
  "serde",
- "wgpu",
- "winit",
 ]
 
 [[package]]
@@ -71,6 +68,17 @@ dependencies = [
  "ttf-parser",
  "web-time",
  "wgpu",
+]
+
+[[package]]
+name = "aetna-winit-wgpu"
+version = "0.1.0"
+dependencies = [
+ "aetna-core",
+ "aetna-wgpu",
+ "pollster",
+ "wgpu",
+ "winit",
 ]
 
 [[package]]

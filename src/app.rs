@@ -135,7 +135,11 @@ impl VolumeApp {
         match ev {
             ProfileEvent::ToggleTrigger(card) => {
                 let mut open = self.profile_dropdown_open.borrow_mut();
-                *open = if *open == Some(card) { None } else { Some(card) };
+                *open = if *open == Some(card) {
+                    None
+                } else {
+                    Some(card)
+                };
             }
             ProfileEvent::Dismiss(_) => {
                 *self.profile_dropdown_open.borrow_mut() = None;
@@ -603,18 +607,8 @@ pub fn slider_percent_from_x(rect: Rect, x: f32) -> u32 {
     (normalized * MAX_VOLUME_PERCENT as f32).round() as u32
 }
 
-fn badge(label: impl Into<String>) -> El {
-    text(label)
-        .caption()
-        .padding(Sides::xy(tokens::SPACE_SM, 3.0))
-        .fill(tokens::BG_MUTED)
-        .stroke(tokens::BORDER)
-        .radius(tokens::RADIUS_PILL)
-}
-
 /// Read-only "this is the default" indicator placed in the device-row
-/// action slot. Distinct from the pill `badge()` so the user doesn't
-/// mistake it for a clickable button.
+/// action slot so the user doesn't mistake it for a clickable button.
 fn default_indicator() -> El {
     text("✓ default")
         .label()
@@ -706,11 +700,7 @@ mod tests {
         // Open the dropdown for the first card.
         app.handle_profile_event(ProfileEvent::ToggleTrigger(card_id));
         let opened = app.build();
-        assert_eq!(
-            opened.children.len(),
-            2,
-            "open: main + popover at the root"
-        );
+        assert_eq!(opened.children.len(), 2, "open: main + popover at the root");
         // Popover scrim's dismiss key matches the trigger key suffix.
         let popover = &opened.children[1];
         let scrim = &popover.children[0];
