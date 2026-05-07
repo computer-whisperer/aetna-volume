@@ -222,33 +222,23 @@ fn run_backend_loop(
                             return;
                         };
                         let bytes = param.as_bytes();
-                        if id == ParamType::Profile {
-                            if let Some(active) = decode_active_profile_index(bytes) {
-                                if let Ok(mut snap) = snapshot_for_param.lock() {
-                                    if let Some(card) =
-                                        snap.cards.iter_mut().find(|c| c.id == card_id)
-                                    {
-                                        card.active_profile = Some(active);
-                                    }
-                                }
-                            }
-                        } else if id == ParamType::EnumProfile {
-                            if let Some(profile) = decode_enum_profile(bytes) {
-                                if let Ok(mut snap) = snapshot_for_param.lock() {
-                                    if let Some(card) =
-                                        snap.cards.iter_mut().find(|c| c.id == card_id)
-                                    {
-                                        if let Some(slot) = card
-                                            .profiles
-                                            .iter_mut()
-                                            .find(|p| p.index == profile.index)
-                                        {
-                                            *slot = profile;
-                                        } else {
-                                            card.profiles.push(profile);
-                                        }
-                                    }
-                                }
+                        if id == ParamType::Profile
+                            && let Some(active) = decode_active_profile_index(bytes)
+                            && let Ok(mut snap) = snapshot_for_param.lock()
+                            && let Some(card) = snap.cards.iter_mut().find(|c| c.id == card_id)
+                        {
+                            card.active_profile = Some(active);
+                        } else if id == ParamType::EnumProfile
+                            && let Some(profile) = decode_enum_profile(bytes)
+                            && let Ok(mut snap) = snapshot_for_param.lock()
+                            && let Some(card) = snap.cards.iter_mut().find(|c| c.id == card_id)
+                        {
+                            if let Some(slot) =
+                                card.profiles.iter_mut().find(|p| p.index == profile.index)
+                            {
+                                *slot = profile;
+                            } else {
+                                card.profiles.push(profile);
                             }
                         }
                     })
@@ -275,7 +265,7 @@ fn run_backend_loop(
                 let is_default_meta = global
                     .props
                     .as_ref()
-                    .and_then(|props| prop(props.as_ref(), "metadata.name"))
+                    .and_then(|props| prop(props, "metadata.name"))
                     .map(|name| name == "default")
                     .unwrap_or(false);
                 if is_default_meta {
@@ -326,10 +316,10 @@ fn run_backend_loop(
             }
 
             if global.type_ == pw::types::ObjectType::Node {
-                if let Some(props) = global.props.as_ref() {
-                    if is_internal_aetna_node(props.as_ref()) {
-                        return;
-                    }
+                if let Some(props) = global.props.as_ref()
+                    && is_internal_aetna_node(props)
+                {
+                    return;
                 }
                 let node_id = global.id;
                 let node = match registry_for_bind.bind::<pw::node::Node, _>(global) {
@@ -357,17 +347,17 @@ fn run_backend_loop(
                         if decoded.mute.is_none() && decoded.scalar.is_none() {
                             return;
                         }
-                        if let Ok(mut snap) = snapshot_for_props.lock() {
-                            if let Some(node) = snap.nodes.iter_mut().find(|n| n.id == node_id) {
-                                let current = node.volume.clone().unwrap_or(Volume {
-                                    scalar: 1.0,
-                                    muted: false,
-                                });
-                                node.volume = Some(Volume {
-                                    scalar: decoded.scalar.unwrap_or(current.scalar),
-                                    muted: decoded.mute.unwrap_or(current.muted),
-                                });
-                            }
+                        if let Ok(mut snap) = snapshot_for_props.lock()
+                            && let Some(node) = snap.nodes.iter_mut().find(|n| n.id == node_id)
+                        {
+                            let current = node.volume.clone().unwrap_or(Volume {
+                                scalar: 1.0,
+                                muted: false,
+                            });
+                            node.volume = Some(Volume {
+                                scalar: decoded.scalar.unwrap_or(current.scalar),
+                                muted: decoded.mute.unwrap_or(current.muted),
+                            });
                         }
                     })
                     .register();
@@ -508,10 +498,10 @@ fn decode_active_profile_index(bytes: &[u8]) -> Option<u32> {
         return None;
     };
     for prop in &obj.properties {
-        if prop.key == pw::spa::sys::SPA_PARAM_PROFILE_index {
-            if let Value::Int(i) = prop.value {
-                return Some(i as u32);
-            }
+        if prop.key == pw::spa::sys::SPA_PARAM_PROFILE_index
+            && let Value::Int(i) = prop.value
+        {
+            return Some(i as u32);
         }
     }
     None

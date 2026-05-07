@@ -406,7 +406,6 @@ fn run_pipewire_linked_meter(
             let Some(props) = global.props.as_ref() else {
                 return;
             };
-            let props = props.as_ref();
 
             let mut state = linker_for_global.borrow_mut();
             match global.type_ {
@@ -499,7 +498,7 @@ fn try_link(core: &pw::core::CoreRc, state: &mut LinkerState, source_node_id: u3
         return;
     }
 
-    for (output_port, input_port) in source_outputs.into_iter().zip(our_inputs.into_iter()) {
+    for (output_port, input_port) in source_outputs.into_iter().zip(our_inputs) {
         let pair = (output_port, input_port);
         if state.links.contains_key(&pair) {
             continue;

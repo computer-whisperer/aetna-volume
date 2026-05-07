@@ -360,32 +360,31 @@ impl AudioSnapshot {
     pub fn nodes_for_tab(&self, tab: Tab) -> Vec<&AudioNode> {
         self.nodes
             .iter()
-            .filter(|node| match (tab, &node.class) {
-                (
-                    Tab::Playback,
-                    AudioClass::Stream {
-                        direction: Direction::Output,
-                    },
-                ) => true,
-                (
-                    Tab::Recording,
-                    AudioClass::Stream {
-                        direction: Direction::Input,
-                    },
-                ) => true,
-                (
-                    Tab::Outputs,
-                    AudioClass::Device {
-                        direction: Direction::Output,
-                    },
-                ) => true,
-                (
-                    Tab::Inputs,
-                    AudioClass::Device {
-                        direction: Direction::Input,
-                    },
-                ) => true,
-                _ => false,
+            .filter(|node| {
+                matches!(
+                    (tab, &node.class),
+                    (
+                        Tab::Playback,
+                        AudioClass::Stream {
+                            direction: Direction::Output
+                        }
+                    ) | (
+                        Tab::Recording,
+                        AudioClass::Stream {
+                            direction: Direction::Input
+                        }
+                    ) | (
+                        Tab::Outputs,
+                        AudioClass::Device {
+                            direction: Direction::Output
+                        }
+                    ) | (
+                        Tab::Inputs,
+                        AudioClass::Device {
+                            direction: Direction::Input
+                        }
+                    )
+                )
             })
             .collect()
     }
