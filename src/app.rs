@@ -220,6 +220,10 @@ impl VolumeApp {
 }
 
 impl App for VolumeApp {
+    fn theme(&self) -> Theme {
+        Theme::radix_slate_blue_dark()
+    }
+
     fn build(&self, _cx: &BuildCx) -> El {
         self.sync_state();
         let snapshot = self.snapshot.borrow();
@@ -238,7 +242,7 @@ impl App for VolumeApp {
         .padding(tokens::SPACE_LG)
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))
-        .fill(tokens::BG_APP);
+        .fill(tokens::BACKGROUND);
 
         // Profile select dropdown — popovers compose at the root of the
         // El tree (see aetna_core widgets::popover docs), so the menu
@@ -475,7 +479,7 @@ fn node_row(
         .padding(tokens::SPACE_MD)
         .width(Size::Fill(1.0))
         .height(Size::Fixed(88.0))
-        .fill(tokens::BG_CARD)
+        .fill(tokens::CARD)
         .stroke(tokens::BORDER)
         .radius(tokens::RADIUS_MD)
 }
@@ -520,14 +524,14 @@ fn card_row(card: &AudioCard, active_profile: Option<u32>) -> El {
     .gap(tokens::SPACE_MD)
     .padding(tokens::SPACE_MD)
     .width(Size::Fill(1.0))
-    .fill(tokens::BG_CARD)
+    .fill(tokens::CARD)
     .stroke(tokens::BORDER)
     .radius(tokens::RADIUS_MD)
 }
 
 fn volume_slider(id: u32, percent: u32, muted: bool) -> El {
     let fill = if muted {
-        tokens::TEXT_MUTED_FOREGROUND
+        tokens::MUTED_FOREGROUND
     } else {
         tokens::PRIMARY
     };
@@ -579,13 +583,13 @@ fn meter_bar(peak: f32, rms: f32, muted: bool) -> El {
     let peak = level_to_meter(peak);
     let rms = level_to_meter(rms);
     let fill = if muted {
-        tokens::TEXT_MUTED_FOREGROUND
+        tokens::MUTED_FOREGROUND
     } else {
         tokens::SUCCESS
     };
     stack([
         El::new(Kind::Custom("activity-track"))
-            .fill(tokens::BG_MUTED)
+            .fill(tokens::MUTED)
             .radius(tokens::RADIUS_PILL),
         El::new(Kind::Custom("activity-rms"))
             .fill(fill.with_alpha(70))
@@ -647,7 +651,7 @@ fn empty_state(tab: Tab) -> El {
     column([
         icon("info")
             .icon_size(28.0)
-            .text_color(tokens::TEXT_MUTED_FOREGROUND),
+            .text_color(tokens::MUTED_FOREGROUND),
         text(format!("No {} streams or devices yet.", tab.label()))
             .label()
             .center_text(),
@@ -661,7 +665,7 @@ fn empty_state(tab: Tab) -> El {
     .justify(Justify::Center)
     .height(Size::Fixed(180.0))
     .width(Size::Fill(1.0))
-    .fill(tokens::BG_CARD)
+    .fill(tokens::CARD)
     .stroke(tokens::BORDER)
     .radius(tokens::RADIUS_MD)
 }
