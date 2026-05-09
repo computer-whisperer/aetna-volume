@@ -1,4 +1,7 @@
-# Aetna Volume
+<h1>
+  <img src="icon.svg" alt="" width="48" height="48" align="left" />
+  Aetna Volume
+</h1>
 
 A PipeWire volume control panel built with Aetna.
 
@@ -35,4 +38,9 @@ A minimal in-tree PKGBUILD is provided. From the repo root:
 ```bash
 makepkg -si
 ```
+
+This installs the `aetna-volume` binary, a hicolor scalable app icon
+(`/usr/share/icons/hicolor/scalable/apps/aetna-volume.svg`), and a
+`.desktop` entry that lands under `AudioVideo → Audio → Mixer` so the
+launcher picks it up without a logout.
 

@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use aetna_core::*;
 
@@ -15,6 +16,13 @@ pub const MAX_VOLUME_PERCENT: u32 = 150;
 /// — automatic routing" entry. Must not collide with any real
 /// `node.name` (no PipeWire node ever uses this string).
 const TARGET_DEFAULT_VALUE: &str = "__aetna_default__";
+
+/// App branding mark shown in the header. Gradients render via Aetna's
+/// per-vertex colour bake so the authored linear/radial gradients land
+/// as drawn; SVG filters (feDropShadow on this asset) are silently
+/// dropped, which is fine — it's just the soft shadow under the knob.
+static APP_ICON: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse(include_str!("../icon.svg")).expect("icon.svg parses"));
 
 pub struct VolumeApp {
     pub backend: Box<dyn AudioBackend>,
@@ -297,8 +305,8 @@ impl App for VolumeApp {
             content.width(Size::Fill(1.0)).height(Size::Fill(1.0)),
             status_bar(&snapshot, self.levels.borrow().active_meter_count()),
         ])
-        .gap(tokens::SPACE_LG)
-        .padding(tokens::SPACE_LG)
+        .gap(tokens::SPACE_4)
+        .padding(tokens::SPACE_4)
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))
         .fill(tokens::BACKGROUND);
@@ -406,18 +414,22 @@ impl App for VolumeApp {
 
 fn header(snapshot: &AudioSnapshot) -> El {
     row([
+        icon(APP_ICON.clone())
+            .icon_size(72.0)
+            .width(Size::Fixed(72.0)),
         column([
             h1("Volume Control"),
             text(snapshot.server_name.as_deref().unwrap_or("PipeWire"))
                 .muted()
                 .label(),
         ])
-        .gap(tokens::SPACE_XS)
+        .gap(tokens::SPACE_1)
         .width(Size::Fill(1.0)),
         button_with_icon("refresh-cw", "Refresh")
             .secondary()
             .key("refresh"),
     ])
+    .gap(tokens::SPACE_3)
     .align(Align::Center)
     .width(Size::Fill(1.0))
 }
@@ -456,7 +468,7 @@ fn node_panel(nodes: Vec<&AudioNode>, tab: Tab, app: &VolumeApp) -> El {
         panel_title(tab.label(), tab_subtitle(tab)),
         scroll(rows).key("node-list").height(Size::Fill(1.0)),
     ])
-    .gap(tokens::SPACE_MD)
+    .gap(tokens::SPACE_3)
 }
 
 /// Resolve the visible label for a stream's target dropdown trigger.
@@ -553,12 +565,12 @@ fn configuration_panel(cards: &[AudioCard], app: &VolumeApp) -> El {
         panel_title(Tab::Configuration.label(), tab_subtitle(Tab::Configuration)),
         scroll(rows).key("cards").height(Size::Fill(1.0)),
     ])
-    .gap(tokens::SPACE_MD)
+    .gap(tokens::SPACE_3)
 }
 
 fn panel_title(title: &'static str, subtitle: &'static str) -> El {
     column([h2(title), text(subtitle).muted().caption()])
-        .gap(tokens::SPACE_XS)
+        .gap(tokens::SPACE_1)
         .width(Size::Fill(1.0))
 }
 
@@ -589,7 +601,7 @@ fn node_row(
                 .width(Size::Fixed(48.0)),
             select_trigger(format!("target:{}", node.id), label.clone()).width(Size::Fill(1.0)),
         ])
-        .gap(tokens::SPACE_SM)
+        .gap(tokens::SPACE_2)
         .align(Align::Center)
         .width(Size::Fill(1.0)),
         None => text(format!(
@@ -621,7 +633,7 @@ fn node_row(
             text(title).label().ellipsis().width(Size::Fill(1.0)),
             secondary,
         ])
-        .gap(tokens::SPACE_XS)
+        .gap(tokens::SPACE_1)
         .width(Size::Fill(1.0)),
         activity_meter(levels.as_ref(), muted).width(Size::Fixed(98.0)),
         volume_slider(node.id, volume, muted).width(Size::Fixed(180.0)),
@@ -654,9 +666,9 @@ fn node_row(
     }
 
     row(children)
-        .gap(tokens::SPACE_MD)
+        .gap(tokens::SPACE_3)
         .align(Align::Center)
-        .padding(tokens::SPACE_MD)
+        .padding(tokens::SPACE_3)
         .width(Size::Fill(1.0))
         .height(Size::Fixed(88.0))
         .fill(tokens::CARD)
@@ -679,10 +691,10 @@ fn card_row(card: &AudioCard, active_profile: Option<u32>) -> El {
                 .muted()
                 .ellipsis(),
         ])
-        .gap(tokens::SPACE_XS)
+        .gap(tokens::SPACE_1)
         .width(Size::Fill(1.0)),
     ])
-    .gap(tokens::SPACE_MD)
+    .gap(tokens::SPACE_3)
     .align(Align::Center);
 
     let profile_picker: El = if card.profiles.is_empty() {
@@ -697,12 +709,12 @@ fn card_row(card: &AudioCard, active_profile: Option<u32>) -> El {
             text("Profile").label().muted().width(Size::Fixed(80.0)),
             profile_picker,
         ])
-        .gap(tokens::SPACE_MD)
+        .gap(tokens::SPACE_3)
         .align(Align::Center)
         .width(Size::Fill(1.0)),
     ])
-    .gap(tokens::SPACE_MD)
-    .padding(tokens::SPACE_MD)
+    .gap(tokens::SPACE_3)
+    .padding(tokens::SPACE_3)
     .width(Size::Fill(1.0))
     .fill(tokens::CARD)
     .stroke(tokens::BORDER)
@@ -847,7 +859,7 @@ fn empty_state(tab: Tab) -> El {
             .muted()
             .center_text(),
     ])
-    .gap(tokens::SPACE_SM)
+    .gap(tokens::SPACE_2)
     .align(Align::Center)
     .justify(Justify::Center)
     .height(Size::Fixed(180.0))

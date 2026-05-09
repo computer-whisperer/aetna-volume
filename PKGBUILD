@@ -28,4 +28,11 @@ package() {
     cd "$startdir"
     install -Dm755 "target/release/aetna-volume" "$pkgdir/usr/bin/aetna-volume"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 aetna-volume.desktop \
+        "$pkgdir/usr/share/applications/aetna-volume.desktop"
+    # Scalable hicolor icon — `Icon=aetna-volume` in the .desktop entry
+    # resolves here. Renaming on install so the icon name is stable
+    # regardless of the source filename.
+    install -Dm644 icon.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/aetna-volume.svg"
 }
