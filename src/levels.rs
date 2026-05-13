@@ -1,5 +1,6 @@
 use pipewire as pw;
 use pw::{properties::properties, spa};
+use rustfft::{Fft, FftPlanner, num_complex::Complex};
 use spa::param::format::{MediaSubtype, MediaType};
 use spa::param::format_utils;
 use spa::pod::Pod;
@@ -16,6 +17,13 @@ use std::{
 };
 
 use crate::model::{AudioClass, AudioNode, Direction};
+
+const FFT_SIZE: usize = 2048;
+const FFT_HOP: usize = 1024;
+const SPECTRUM_BINS: usize = 72;
+const SPECTRUM_HISTORY: usize = 256;
+const MIN_SPECTRUM_HZ: f32 = 35.0;
+const MAX_SPECTRUM_HZ: f32 = 18_000.0;
 
 #[derive(Debug, Clone, Default)]
 pub struct NodeLevels {
@@ -37,9 +45,34 @@ impl NodeLevels {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SpectrumSnapshot {
+    pub columns: Vec<Vec<f32>>,
+    pub bins: usize,
+    pub history: usize,
+    pub sample_rate: u32,
+    pub min_hz: f32,
+    pub max_hz: f32,
+}
+
+impl Default for SpectrumSnapshot {
+    fn default() -> Self {
+        Self {
+            columns: Vec::new(),
+            bins: SPECTRUM_BINS,
+            history: SPECTRUM_HISTORY,
+            sample_rate: 48_000,
+            min_hz: MIN_SPECTRUM_HZ,
+            max_hz: MAX_SPECTRUM_HZ,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct LevelService {
     levels: Arc<Mutex<HashMap<u32, NodeLevels>>>,
+    spectra: Arc<Mutex<HashMap<u32, SpectrumSnapshot>>>,
+    spectrum_nodes: Arc<Mutex<HashSet<u32>>>,
     meters: HashMap<u32, MeterHandle>,
 }
 
@@ -55,12 +88,18 @@ impl LevelService {
     /// detectors, like pavucontrol's "PulseAudio Volume Control" capture
     /// streams) are skipped unconditionally to keep us out of a
     /// metering-each-other feedback loop.
-    pub fn ensure_visible(&mut self, visible: &[&AudioNode]) {
-        let wanted = visible
+    pub fn ensure_visible(&mut self, visible: &[&AudioNode], spectrum_node: Option<&AudioNode>) {
+        let mut wanted = visible
             .iter()
             .filter(|node| meter_route_for(node).is_some())
             .map(|node| node.id)
             .collect::<HashSet<_>>();
+        let spectrum_node_id = spectrum_node
+            .filter(|node| meter_route_for(node).is_some())
+            .map(|node| node.id);
+        if let Some(node_id) = spectrum_node_id {
+            wanted.insert(node_id);
+        }
         self.meters.retain(|node_id, meter| {
             let keep = wanted.contains(node_id);
             if !keep {
@@ -71,7 +110,19 @@ impl LevelService {
         if let Ok(mut levels) = self.levels.lock() {
             levels.retain(|node_id, _| wanted.contains(node_id));
         }
+        if let Ok(mut spectrum_nodes) = self.spectrum_nodes.lock() {
+            spectrum_nodes.clear();
+            if let Some(node_id) = spectrum_node_id {
+                spectrum_nodes.insert(node_id);
+            }
+        }
+        if let Ok(mut spectra) = self.spectra.lock() {
+            spectra.retain(|node_id, _| Some(*node_id) == spectrum_node_id);
+        }
         for node in visible {
+            self.ensure_node(node);
+        }
+        if let Some(node) = spectrum_node {
             self.ensure_node(node);
         }
     }
@@ -81,6 +132,13 @@ impl LevelService {
             .lock()
             .ok()
             .and_then(|levels| levels.get(&node_id).cloned())
+    }
+
+    pub fn spectrum_for(&self, node_id: u32) -> Option<SpectrumSnapshot> {
+        self.spectra
+            .lock()
+            .ok()
+            .and_then(|spectra| spectra.get(&node_id).cloned())
     }
 
     pub fn active_meter_count(&self) -> usize {
@@ -95,7 +153,14 @@ impl LevelService {
             return;
         };
         let stop = Arc::new(AtomicBool::new(false));
-        spawn_meter(node.id, route, self.levels.clone(), stop.clone());
+        spawn_meter(
+            node.id,
+            route,
+            self.levels.clone(),
+            self.spectra.clone(),
+            self.spectrum_nodes.clone(),
+            stop.clone(),
+        );
         self.meters.insert(node.id, MeterHandle { stop });
     }
 }
@@ -117,9 +182,12 @@ struct MeterData {
     format: spa::param::audio::AudioInfoRaw,
     mainloop: pw::main_loop::MainLoopRc,
     levels: Arc<Mutex<HashMap<u32, NodeLevels>>>,
+    spectra: Arc<Mutex<HashMap<u32, SpectrumSnapshot>>>,
+    spectrum_nodes: Arc<Mutex<HashSet<u32>>>,
     stop: Arc<AtomicBool>,
     smooth_peaks: Vec<f32>,
     smooth_rms: Vec<f32>,
+    spectrum: Option<SpectrumProcessor>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +237,8 @@ fn spawn_meter(
     node_id: u32,
     route: MeterRoute,
     levels: Arc<Mutex<HashMap<u32, NodeLevels>>>,
+    spectra: Arc<Mutex<HashMap<u32, SpectrumSnapshot>>>,
+    spectrum_nodes: Arc<Mutex<HashSet<u32>>>,
     stop: Arc<AtomicBool>,
 ) {
     let thread_name = format!("aetna-volume-meter-{node_id}");
@@ -176,10 +246,17 @@ fn spawn_meter(
         .name(thread_name)
         .spawn(move || {
             let result = match route {
-                MeterRoute::AutoConnect { capture_sink } => {
-                    run_pipewire_auto_meter(node_id, capture_sink, levels, stop)
+                MeterRoute::AutoConnect { capture_sink } => run_pipewire_auto_meter(
+                    node_id,
+                    capture_sink,
+                    levels,
+                    spectra,
+                    spectrum_nodes,
+                    stop,
+                ),
+                MeterRoute::LinkFromOutputs => {
+                    run_pipewire_linked_meter(node_id, levels, spectra, spectrum_nodes, stop)
                 }
-                MeterRoute::LinkFromOutputs => run_pipewire_linked_meter(node_id, levels, stop),
             };
             if let Err(err) = result {
                 eprintln!("aetna-volume: level meter for node {node_id} stopped: {err}");
@@ -192,6 +269,8 @@ fn run_pipewire_auto_meter(
     node_id: u32,
     capture_sink: bool,
     levels: Arc<Mutex<HashMap<u32, NodeLevels>>>,
+    spectra: Arc<Mutex<HashMap<u32, SpectrumSnapshot>>>,
+    spectrum_nodes: Arc<Mutex<HashSet<u32>>>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     pipewire_init();
@@ -221,9 +300,12 @@ fn run_pipewire_auto_meter(
         format: Default::default(),
         mainloop: mainloop.clone(),
         levels,
+        spectra,
+        spectrum_nodes,
         stop,
         smooth_peaks: Vec::new(),
         smooth_rms: Vec::new(),
+        spectrum: None,
     };
 
     let _listener = stream
@@ -301,6 +383,8 @@ fn run_pipewire_auto_meter(
 fn run_pipewire_linked_meter(
     source_node_id: u32,
     levels: Arc<Mutex<HashMap<u32, NodeLevels>>>,
+    spectra: Arc<Mutex<HashMap<u32, SpectrumSnapshot>>>,
+    spectrum_nodes: Arc<Mutex<HashSet<u32>>>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     pipewire_init();
@@ -324,9 +408,12 @@ fn run_pipewire_linked_meter(
         format: Default::default(),
         mainloop: mainloop.clone(),
         levels,
+        spectra,
+        spectrum_nodes,
         stop,
         smooth_peaks: Vec::new(),
         smooth_rms: Vec::new(),
+        spectrum: None,
     };
 
     let _listener = stream
@@ -552,6 +639,21 @@ fn process_meter_buffer(stream: &pw::stream::Stream, data: &mut MeterData) {
         &mut data.smooth_peaks,
         &mut data.smooth_rms,
     );
+    if data
+        .spectrum_nodes
+        .try_lock()
+        .map(|nodes| nodes.contains(&data.node_id))
+        .unwrap_or(false)
+    {
+        publish_spectrum_samples(
+            data.node_id,
+            &samples[..usable],
+            channels,
+            data.format.rate(),
+            &data.spectra,
+            &mut data.spectrum,
+        );
+    }
 }
 
 fn publish_level_samples(
@@ -623,6 +725,156 @@ fn smooth(previous: f32, next: f32, release: f32) -> f32 {
     } else {
         previous * release + next * (1.0 - release)
     }
+}
+
+struct SpectrumProcessor {
+    sample_rate: u32,
+    window: Vec<f32>,
+    pending: Vec<f32>,
+    input: Vec<Complex<f32>>,
+    fft: Arc<dyn Fft<f32>>,
+    last_bins: Vec<f32>,
+}
+
+impl SpectrumProcessor {
+    fn new(sample_rate: u32) -> Self {
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(FFT_SIZE);
+        let window = (0..FFT_SIZE)
+            .map(|i| {
+                let phase = std::f32::consts::TAU * i as f32 / (FFT_SIZE - 1) as f32;
+                0.5 - 0.5 * phase.cos()
+            })
+            .collect();
+        Self {
+            sample_rate,
+            window,
+            pending: Vec::with_capacity(FFT_SIZE * 2),
+            input: vec![Complex::default(); FFT_SIZE],
+            fft,
+            last_bins: vec![0.0; SPECTRUM_BINS],
+        }
+    }
+
+    fn push_samples(&mut self, mono: &[f32]) -> Option<Vec<f32>> {
+        self.pending.extend_from_slice(mono);
+        let mut latest = None;
+        while self.pending.len() >= FFT_SIZE {
+            latest = Some(self.compute_column());
+            self.pending.drain(..FFT_HOP);
+        }
+        latest
+    }
+
+    fn compute_column(&mut self) -> Vec<f32> {
+        for (i, input) in self.input.iter_mut().enumerate() {
+            input.re = self.pending[i] * self.window[i];
+            input.im = 0.0;
+        }
+        self.fft.process(&mut self.input);
+
+        let nyquist = self.sample_rate as f32 * 0.5;
+        let max_hz = MAX_SPECTRUM_HZ.min(nyquist);
+        let min_log = MIN_SPECTRUM_HZ.ln();
+        let max_log = max_hz.ln();
+        let mut bins = vec![0.0; SPECTRUM_BINS];
+        for (bin, value) in bins.iter_mut().enumerate() {
+            let low_t = bin as f32 / SPECTRUM_BINS as f32;
+            let high_t = (bin + 1) as f32 / SPECTRUM_BINS as f32;
+            let low_hz = (min_log + (max_log - min_log) * low_t).exp();
+            let high_hz = (min_log + (max_log - min_log) * high_t).exp();
+            let low_i = hz_to_fft_index(low_hz, self.sample_rate).max(1);
+            let high_i = hz_to_fft_index(high_hz, self.sample_rate)
+                .max(low_i + 1)
+                .min(FFT_SIZE / 2);
+            let mut peak = 0.0_f32;
+            for i in low_i..high_i {
+                let c = self.input[i];
+                peak = peak.max((c.re * c.re + c.im * c.im).sqrt());
+            }
+            let normalized_mag = peak / (FFT_SIZE as f32 * 0.5);
+            let db = 20.0 * normalized_mag.max(0.000_001).log10();
+            let raw = ((db + 78.0) / 72.0).clamp(0.0, 1.0);
+            let prev = self.last_bins[bin];
+            *value = if raw > prev {
+                prev * 0.30 + raw * 0.70
+            } else {
+                prev * 0.82 + raw * 0.18
+            };
+        }
+        self.last_bins.clone_from(&bins);
+        bins
+    }
+}
+
+fn publish_spectrum_samples(
+    node_id: u32,
+    samples: &[u8],
+    channels: usize,
+    sample_rate: u32,
+    spectra: &Arc<Mutex<HashMap<u32, SpectrumSnapshot>>>,
+    processor: &mut Option<SpectrumProcessor>,
+) {
+    if channels == 0 || samples.len() < 4 {
+        return;
+    }
+    let sample_rate = sample_rate.max(1);
+    if processor
+        .as_ref()
+        .map(|processor| processor.sample_rate != sample_rate)
+        .unwrap_or(true)
+    {
+        *processor = Some(SpectrumProcessor::new(sample_rate));
+    }
+
+    let sample_count = samples.len() / 4;
+    let frame_count = sample_count / channels;
+    if frame_count == 0 {
+        return;
+    }
+
+    let mut mono = Vec::with_capacity(frame_count);
+    for frame in 0..frame_count {
+        let mut sum = 0.0_f32;
+        for channel in 0..channels {
+            let sample_index = frame * channels + channel;
+            let start = sample_index * 4;
+            let Ok(bytes) = samples[start..start + 4].try_into() else {
+                continue;
+            };
+            sum += f32::from_le_bytes(bytes);
+        }
+        mono.push(sum / channels as f32);
+    }
+
+    let Some(column) = processor
+        .as_mut()
+        .and_then(|processor| processor.push_samples(&mono))
+    else {
+        return;
+    };
+
+    if let Ok(mut spectra) = spectra.try_lock() {
+        let entry = spectra.entry(node_id).or_insert_with(|| SpectrumSnapshot {
+            sample_rate,
+            ..SpectrumSnapshot::default()
+        });
+        if entry.sample_rate != sample_rate {
+            *entry = SpectrumSnapshot {
+                sample_rate,
+                ..SpectrumSnapshot::default()
+            };
+        }
+        entry.columns.push(column);
+        if entry.columns.len() > entry.history {
+            let overflow = entry.columns.len() - entry.history;
+            entry.columns.drain(..overflow);
+        }
+    }
+}
+
+fn hz_to_fft_index(hz: f32, sample_rate: u32) -> usize {
+    ((hz / sample_rate as f32) * FFT_SIZE as f32).round() as usize
 }
 
 fn pipewire_init() {

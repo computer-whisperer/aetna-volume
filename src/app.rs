@@ -2,10 +2,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use aetna_core::prelude::{Image, ImageFit, image};
 use aetna_core::*;
 
 use crate::backend::AudioBackend;
-use crate::levels::{LevelService, NodeLevels};
+use crate::levels::{LevelService, NodeLevels, SpectrumSnapshot};
 use crate::model::{
     AudioCard, AudioClass, AudioNode, AudioSnapshot, Direction, ProfileAvailability, Tab, Volume,
 };
@@ -17,6 +18,8 @@ pub const MAX_VOLUME_PERCENT: u32 = 150;
 /// — automatic routing" entry. Must not collide with any real
 /// `node.name` (no PipeWire node ever uses this string).
 const TARGET_DEFAULT_VALUE: &str = "__aetna_default__";
+const WATERFALL_WIDTH: u32 = 256;
+const WATERFALL_HEIGHT: u32 = 96;
 
 /// App branding mark shown in the header. Gradients render via Aetna's
 /// per-vertex colour bake so the authored linear/radial gradients land
@@ -62,7 +65,10 @@ impl VolumeApp {
     pub fn new(backend: Box<dyn AudioBackend>) -> Self {
         let snapshot = backend.refresh();
         let mut levels = LevelService::new();
-        levels.ensure_visible(&snapshot.nodes_for_tab(Tab::Playback));
+        levels.ensure_visible(
+            &snapshot.nodes_for_tab(Tab::Playback),
+            default_output_node(&snapshot),
+        );
         Self {
             backend,
             active_tab: Tab::Playback,
@@ -92,7 +98,9 @@ impl VolumeApp {
     fn sync_state(&self) {
         let snapshot = self.backend.refresh();
         let visible = snapshot.nodes_for_tab(self.active_tab);
-        self.levels.borrow_mut().ensure_visible(&visible);
+        self.levels
+            .borrow_mut()
+            .ensure_visible(&visible, default_output_node(&snapshot));
         *self.snapshot.borrow_mut() = snapshot;
     }
 
@@ -299,12 +307,21 @@ impl App for VolumeApp {
             Tab::Configuration => configuration_panel(&snapshot.cards, self),
             tab => node_panel(snapshot.nodes_for_tab(tab), tab, self),
         };
+        let default_output = default_output_node(&snapshot);
+        let (default_spectrum, meter_count) = {
+            let levels = self.levels.borrow();
+            (
+                default_output.and_then(|node| levels.spectrum_for(node.id)),
+                levels.active_meter_count(),
+            )
+        };
 
         let main = column([
             header(&snapshot),
             tab_bar(self.active_tab),
             content.width(Size::Fill(1.0)).height(Size::Fill(1.0)),
-            status_bar(&snapshot, self.levels.borrow().active_meter_count()),
+            spectrum_card(default_output, default_spectrum),
+            status_bar(&snapshot, meter_count),
         ])
         .gap(tokens::SPACE_4)
         .padding(tokens::SPACE_4)
@@ -531,6 +548,164 @@ fn tab_subtitle(tab: Tab) -> &'static str {
         Tab::Inputs => "Audio sources — microphones, line-in, virtual inputs.",
         Tab::Configuration => "Cards, profiles, and ports.",
     }
+}
+
+fn default_output_node(snapshot: &AudioSnapshot) -> Option<&AudioNode> {
+    snapshot.nodes.iter().find(|node| {
+        snapshot.default_sink_name.as_deref() == Some(node.name.as_str())
+            && matches!(
+                node.class,
+                AudioClass::Device {
+                    direction: Direction::Output
+                }
+            )
+    })
+}
+
+fn spectrum_card(node: Option<&AudioNode>, spectrum: Option<SpectrumSnapshot>) -> El {
+    let status = match (&node, &spectrum) {
+        (Some(_), Some(spectrum)) if !spectrum.columns.is_empty() => {
+            format!("{} Hz", spectrum.sample_rate)
+        }
+        (Some(_), _) => "Listening".to_string(),
+        (None, _) => "No default output".to_string(),
+    };
+    let subtitle = node
+        .map(|node| node.description.as_str())
+        .unwrap_or("Waiting for PipeWire default sink metadata");
+
+    card([
+        row([
+            row([
+                icon("activity")
+                    .icon_size(18.0)
+                    .text_color(tokens::PRIMARY)
+                    .width(Size::Fixed(24.0)),
+                column([
+                    text("Default Output Spectrum").label(),
+                    text(subtitle).caption().muted().ellipsis(),
+                ])
+                .gap(2.0)
+                .width(Size::Fill(1.0)),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .width(Size::Fill(1.0)),
+            badge(status),
+        ])
+        .gap(tokens::SPACE_3)
+        .align(Align::Center)
+        .width(Size::Fill(1.0)),
+        row([
+            column([
+                text("18k").caption().mono().muted(),
+                spacer(),
+                text("1k").caption().mono().muted(),
+                spacer(),
+                text("35").caption().mono().muted(),
+            ])
+            .align(Align::End)
+            .height(Size::Fixed(96.0))
+            .width(Size::Fixed(32.0)),
+            column([
+                image(waterfall_image(spectrum.as_ref()))
+                    .image_fit(ImageFit::Fill)
+                    .radius(6.0)
+                    .width(Size::Fill(1.0))
+                    .height(Size::Fixed(96.0)),
+                row([
+                    text("-6s").caption().mono().muted(),
+                    spacer(),
+                    text("now").caption().mono().muted(),
+                ])
+                .width(Size::Fill(1.0)),
+            ])
+            .gap(5.0)
+            .width(Size::Fill(1.0)),
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0)),
+    ])
+    .gap(tokens::SPACE_3)
+    .padding(tokens::SPACE_3)
+    .height(Size::Fixed(184.0))
+}
+
+fn waterfall_image(spectrum: Option<&SpectrumSnapshot>) -> Image {
+    let mut pixels = vec![0_u8; (WATERFALL_WIDTH * WATERFALL_HEIGHT * 4) as usize];
+    let columns = spectrum.map(|s| s.columns.as_slice()).unwrap_or(&[]);
+    let bins = spectrum.map(|s| s.bins).unwrap_or(72).max(1);
+    let draw_start_x = WATERFALL_WIDTH.saturating_sub(columns.len() as u32);
+
+    for y in 0..WATERFALL_HEIGHT {
+        for x in 0..WATERFALL_WIDTH {
+            let column_index = if x < draw_start_x {
+                None
+            } else {
+                Some((x - draw_start_x) as usize)
+            };
+            let bin = ((WATERFALL_HEIGHT - 1 - y) as usize * bins / WATERFALL_HEIGHT as usize)
+                .min(bins - 1);
+            let value = column_index
+                .and_then(|i| columns.get(i))
+                .and_then(|column| column.get(bin))
+                .copied()
+                .unwrap_or(0.0);
+            let mut color = waterfall_color(value);
+            if x % 32 == 0 || y % 24 == 0 {
+                color = blend_rgba(color, [42, 55, 70, 255], 0.34);
+            }
+            if x + 1 == WATERFALL_WIDTH {
+                color = blend_rgba(color, [68, 167, 210, 255], 0.45);
+            }
+            let offset = ((y * WATERFALL_WIDTH + x) * 4) as usize;
+            pixels[offset..offset + 4].copy_from_slice(&color);
+        }
+    }
+
+    Image::from_rgba8(WATERFALL_WIDTH, WATERFALL_HEIGHT, pixels)
+}
+
+fn waterfall_color(value: f32) -> [u8; 4] {
+    let value = value.clamp(0.0, 1.0).powf(0.78);
+    let stops = [
+        (0.00, [11, 16, 24]),
+        (0.18, [18, 31, 45]),
+        (0.42, [34, 91, 145]),
+        (0.68, [46, 177, 184]),
+        (0.88, [210, 178, 86]),
+        (1.00, [245, 236, 190]),
+    ];
+    for pair in stops.windows(2) {
+        let (a_pos, a) = pair[0];
+        let (b_pos, b) = pair[1];
+        if value <= b_pos {
+            let t = ((value - a_pos) / (b_pos - a_pos)).clamp(0.0, 1.0);
+            return [
+                lerp_u8(a[0], b[0], t),
+                lerp_u8(a[1], b[1], t),
+                lerp_u8(a[2], b[2], t),
+                255,
+            ];
+        }
+    }
+    [245, 236, 190, 255]
+}
+
+fn blend_rgba(base: [u8; 4], overlay: [u8; 4], amount: f32) -> [u8; 4] {
+    [
+        lerp_u8(base[0], overlay[0], amount),
+        lerp_u8(base[1], overlay[1], amount),
+        lerp_u8(base[2], overlay[2], amount),
+        255,
+    ]
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 fn configuration_panel(cards: &[AudioCard], app: &VolumeApp) -> El {
