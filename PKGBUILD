@@ -1,8 +1,4 @@
 # Maintainer: Christian Balcom <robot.inventor@gmail.com>
-#
-# In-tree PKGBUILD: builds the working copy in place. Run `makepkg -si` from
-# this directory to install the current source. AUR-quality packaging would
-# fetch a tagged release tarball instead of consuming $startdir.
 
 pkgname=aetna-volume
 pkgver=0.2.2
@@ -17,15 +13,36 @@ makedepends=('cargo' 'pkgconf')
 # libspa's C wrapper (compiled by its build.rs via the `cc` crate) emit
 # LTO-IR objects, which rust-lld can't resolve at the final Rust link step.
 options=('!lto')
+source=(
+    "$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+    'LICENSE-MIT'
+)
+sha256sums=(
+    '21c47ae632ec2c58f32faf949536f5d3777e3031263dbda441530200986687c7'
+    '9f00c7ed7074fac147074cf3440eb30099ca20ffce962d9fda4188d84bcdface'
+)
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
 
 build() {
-    cd "$startdir"
-    export CARGO_TARGET_DIR="$startdir/target"
-    cargo build --release --locked --bin aetna-volume
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --release --frozen --bin aetna-volume
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --release --frozen --lib
 }
 
 package() {
-    cd "$startdir"
+    cd "$pkgname-$pkgver"
     install -Dm755 "target/release/aetna-volume" "$pkgdir/usr/bin/aetna-volume"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 aetna-volume.desktop \
@@ -35,4 +52,6 @@ package() {
     # regardless of the source filename.
     install -Dm644 icon.svg \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/aetna-volume.svg"
+    install -Dm644 "$srcdir/LICENSE-MIT" \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
 }

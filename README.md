@@ -33,18 +33,12 @@ we can name PipeWire objects and routes correctly.
 cargo run
 ```
 
-Aetna is consumed from crates.io (currently `aetna-core`/`aetna-winit-wgpu` 0.3.2).
+Aetna is consumed from crates.io (currently `aetna-core`/`aetna-winit-wgpu` 0.3.3).
 
-## Local install (Arch)
+## Arch package
 
-A minimal in-tree PKGBUILD is provided. From the repo root:
-
-```bash
-makepkg -si
-```
-
-This installs the `aetna-volume` binary, a hicolor scalable app icon
-(`/usr/share/icons/hicolor/scalable/apps/aetna-volume.svg`), and a
-`.desktop` entry that lands under `AudioVideo → Audio → Mixer` so the
-launcher picks it up without a logout.
-
+An AUR-oriented `PKGBUILD` is provided for tagged releases. It installs the
+`aetna-volume` binary, a hicolor scalable app icon
+(`/usr/share/icons/hicolor/scalable/apps/aetna-volume.svg`), and a `.desktop`
+entry that lands under `AudioVideo → Audio → Mixer` so the launcher picks it up
+without a logout.
