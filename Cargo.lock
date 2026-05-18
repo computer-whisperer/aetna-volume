@@ -26,9 +26,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aetna-core"
-version = "0.3.3"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7d545cb3e7fcc0837f610fcc8bd36bf84ec14ea5f87fd72eedb7c8e63321ff9"
+checksum = "80782adf8ff745d676eab958c0c3ae498746a9ff9dd46f5975e6ede2b24db344"
 dependencies = [
  "aetna-fonts",
  "bytemuck",
@@ -50,9 +50,9 @@ dependencies = [
 
 [[package]]
 name = "aetna-fonts"
-version = "0.3.3"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ad5d06d160265a45e2c9eaefc837f662e1379a66b5f2e6d2eef81ef73dc883f"
+checksum = "b945041afe0413409bc3a6fc7b37688a95406951114d63df780788ad3ede03b1"
 dependencies = [
  "aetna-fonts-emoji",
  "aetna-fonts-inter",
@@ -99,9 +99,9 @@ dependencies = [
 
 [[package]]
 name = "aetna-wgpu"
-version = "0.3.3"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bcc55428a801fc889a5fb8fb985d0919915910c77d13e03ce87ea7bb2c77d8e"
+checksum = "9b8a08274aa9bb7c656ec5770299ffc67b4d5064d96a91e3fc92921b7839b0ae"
 dependencies = [
  "aetna-core",
  "bytemuck",
@@ -113,13 +113,14 @@ dependencies = [
 
 [[package]]
 name = "aetna-winit-wgpu"
-version = "0.3.3"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ded1675ca9bfb3e9b253cbb152f9693a33b939a61871a7087c3919b74f282364"
+checksum = "a55559f525d24062a4607d3de891988289aa56f99c6f6af06e6483a3ebd53b13"
 dependencies = [
  "aetna-core",
  "aetna-wgpu",
  "arboard",
+ "jni",
  "open",
  "pollster",
  "wgpu",
