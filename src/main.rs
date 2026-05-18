@@ -15,7 +15,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Aetna Volume",
         viewport,
         VolumeApp::new(Box::new(PipeWireBackend::new())),
-        HostConfig::default().with_redraw_interval(METER_FRAME_INTERVAL),
+        // `low_latency_present` flips the surface to Mailbox so an
+        // interactive resize on Wayland/Mesa doesn't show several
+        // configures-stale frames before catching up — the residual
+        // lag the in-host resize coalescing can't address. The usual
+        // Mailbox-burns-cycles trade-off is bounded here by
+        // `redraw_interval` pinning the meter cadence to 30fps.
+        HostConfig::default()
+            .with_redraw_interval(METER_FRAME_INTERVAL)
+            .with_low_latency_present(true),
     )
 }
 
