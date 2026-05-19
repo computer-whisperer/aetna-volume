@@ -1,8 +1,8 @@
 # Maintainer: Christian Balcom <robot.inventor@gmail.com>
 
 pkgname=aetna-volume
-pkgver=0.2.2
-pkgrel=2
+pkgver=0.2.3
+pkgrel=1
 pkgdesc='PipeWire volume control panel built with Aetna'
 arch=('x86_64')
 url='https://github.com/computer-whisperer/aetna-volume'
